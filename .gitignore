@@ -3,7 +3,7 @@ data/*
 ocr-env/Lib/site-packages/*
 .cursor/*
 .vscode/*
-=2.10.0/*
+=2.10.0
 KERAS_OCR_GUIDE.md
 PROJECT_CAPABILITIES.md
 SCRIPT_CLEANUP_ANALYSIS.md
