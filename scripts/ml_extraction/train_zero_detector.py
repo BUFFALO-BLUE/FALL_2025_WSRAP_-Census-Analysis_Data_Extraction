@@ -71,7 +71,7 @@ def load_training_data():
     for _, row in df.iterrows():
         img_path = samples_dir / row['filename']
         if img_path.exists():
-            img = cv2.imread(str(img_path), 0)  # Grayscale
+            img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 # Resize to 50x50
                 img_resized = cv2.resize(img, (50, 50))
@@ -103,6 +103,7 @@ def load_training_data():
     images = images.astype(np.float32) / 255.0
     images = np.expand_dims(images, axis=-1)  # Add channel dimension
     
+    print("sample of normalized image", images[0]) # todo: play with it
     print(f"✅ Loaded {len(images)} labeled samples")
     print(f"   '0' samples (head): {np.sum(labels)}")
     print(f"   'not 0' samples: {len(labels) - np.sum(labels)}")
@@ -129,6 +130,13 @@ def create_model():
         keras.layers.Dropout(0.5),
         keras.layers.Dense(1, activation='sigmoid')  # Binary: '0' or not
     ])
+    # consider detecting other numbers and not just zero.  also consider logic for model structure.
+
+    # consider whether model is complicated enough to capture the entropy of the image.
+    # consider making bigger kernel size
+
+    # consider improving your other model that cuts the image, make it more reliable, then use a pre-existing model to detect the number
+    # consider using a pre-existing model for both steps; cutting and detecting numbers, because your data set is too small
     
     model.compile(
         optimizer='adam',
@@ -166,7 +174,14 @@ def train_model():
     print(f"\n📊 Data split:")
     print(f"   Train: {len(X_train)} samples ({np.sum(y_train)} '0', {len(y_train)-np.sum(y_train)} not '0')")
     print(f"   Val: {len(X_val)} samples ({np.sum(y_val)} '0', {len(y_val)-np.sum(y_val)} not '0')")
-    
+
+    if {np.sum(y_train)} < 3 or {len(y_train)-np.sum(y_train)} < 3:
+        print("want at least 3 of each category in the training set")
+
+    if {np.sum(y_val)} < 3 or {len(y_val)-np.sum(y_val)} < 3:
+        print("want at least 3 of each category in the validation set")
+        
+        
     # Create model
     model = create_model()
     

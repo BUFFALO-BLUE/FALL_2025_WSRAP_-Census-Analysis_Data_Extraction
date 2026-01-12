@@ -1,316 +1,538 @@
-import cv2
-import numpy as np
 import os
+import cv2
+import json
+import numpy as np
 
-def smart_adaptive_extraction():
-    """Smart adaptive extraction with ALL required columns and head filtering"""
-    
-    # Load the preprocessed image
-    original = cv2.imread('data/processed/preprocessed_image.png', 0)
-    if original is None:
-        print("Error: Could not load preprocessed image")
-        return
-    
-    print("=== SMART ADAPTIVE EXTRACTION ===")
-    print(f"Image size: {original.shape}")
-    
-    # ALL REQUIRED COLUMNS FROM OUR MEETING
-    columns = {
-        # Column 1 Name of Steer
-        'street': (629, 718),
-        # Column 2 - House number
-        'house_number': (718, 836),
-        
-        # Column 4 - Rented or owned
-        'rented_owned': (914, 994),
-        
-        # Column 5 - Price of rent 
-        'price_rent': (996, 1143),
-        
-        # Column 8 - Head indicator (look for 'o')
-        'head': (1889, 2204),
-        
-        # Column 9 - Gender 
-        'gender': (2204, 2285),
 
-        # Column 10 - Race
-        'race': (2285, 2388),
-        
-        # Column 12 - Marital status (FIXED coordinates)
-        'marital_status': (2491, 2574),
-        
-        # Column 26 - Hours worked
-        'hours_worked': (4939, 5092),
-        
-        # Column 32 - Wages
-        'wages': (6433, 6588)
+# ============================================================
+# CONFIG
+# ============================================================
+
+INPUT_DIR = "data/from_jeremy/images_aligned_to_first"
+OUTPUT_DIR = "data/processed/smart_adaptive_extraction_batch_v3"
+
+# The census people-table has 40 rows (your statement)
+NUM_ROWS = 40
+
+# Priors (used ONLY to find the correct two anchor lines per image)
+FIRST_ROW_Y_PRIOR = 1263
+EXPECTED_ROW_HEIGHT = 78
+BOTTOM_TABLE_Y_PRIOR = FIRST_ROW_Y_PRIOR + (EXPECTED_ROW_HEIGHT * NUM_ROWS)  # ~4383
+
+# Column coordinates (after deskew, these become much more reliable)
+COLUMNS = {
+    "street": (629, 718),
+    "house_number": (718, 836),
+
+    # adjust if needed
+    "rented": (914, 954),
+    "owned":  (954, 994),
+
+    "price_rent": (996, 1143),
+
+    # kept as data, NOT used for head detection
+    "head": (1889, 2204),
+
+    "gender": (2204, 2285),
+    "race": (2285, 2388),
+    "marital_status": (2491, 2574),
+    "hours_worked": (4939, 5092),
+    "wages": (6433, 6588),
+}
+
+SAVE_VIZ = True
+SAVE_CELLS = True
+
+# Ink detection knobs (tune if needed)
+INK_PAD = 12
+MIN_INK_RATIO = 0.010
+MIN_CC_AREA = 60
+
+# Horizontal-line detection knobs
+ROW_LINE_PROJ_THRESH = 0.18   # lower -> more sensitive to lines
+ROW_LINE_MERGE_DIST = 6
+
+# How far we allow the chosen anchors to deviate from priors
+TOP_ANCHOR_MAX_DELTA = 220     # pixels
+BOTTOM_ANCHOR_MAX_DELTA = 260  # pixels
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def list_images(folder: str):
+    exts = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+    if not os.path.isdir(folder):
+        return []
+    return sorted(
+        os.path.join(folder, f)
+        for f in os.listdir(folder)
+        if f.lower().endswith(exts)
+    )
+
+def read_gray(path: str):
+    return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+
+def robust_binarize(gray: np.ndarray) -> np.ndarray:
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    return cv2.adaptiveThreshold(
+        blur, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31, 11
+    )
+
+def group_nearby_positions(pos, merge_dist=6):
+    if not pos:
+        return []
+    pos = sorted(pos)
+    grouped = [pos[0]]
+    for p in pos[1:]:
+        if abs(p - grouped[-1]) <= merge_dist:
+            grouped[-1] = int((grouped[-1] + p) / 2)
+        else:
+            grouped.append(p)
+    return grouped
+
+
+# ============================================================
+# Deskew
+# ============================================================
+
+def estimate_skew_angle_degrees(gray: np.ndarray) -> float:
+    """
+    Estimate skew using long horizontal table lines via HoughLinesP.
+    Returns angle in degrees (near 0 if already straight).
+    """
+    bin_img = robust_binarize(gray)
+    inv = 255 - bin_img
+
+    h, w = inv.shape
+    k_w = max(40, w // 25)
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, 1))
+    horiz = cv2.morphologyEx(inv, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
+
+    edges = cv2.Canny(horiz, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=120,
+        minLineLength=max(250, w // 5),
+        maxLineGap=25
+    )
+
+    if lines is None:
+        return 0.0
+
+    angles = []
+    for x1, y1, x2, y2 in lines[:, 0]:
+        dx = x2 - x1
+        dy = y2 - y1
+        if dx == 0:
+            continue
+        angle = np.degrees(np.arctan2(dy, dx))
+        if -20 <= angle <= 20:
+            angles.append(angle)
+
+    if not angles:
+        return 0.0
+
+    return float(np.median(angles))
+
+def rotate_image(gray: np.ndarray, angle_deg: float) -> np.ndarray:
+    if abs(angle_deg) < 0.05:
+        return gray
+    h, w = gray.shape
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    return cv2.warpAffine(
+        gray,
+        M,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+# ============================================================
+# Detect horizontal table lines, then enforce UNIFORM 40 rows
+# ============================================================
+
+def detect_horizontal_lines(gray: np.ndarray) -> list:
+    """
+    Returns list of y positions where strong horizontal lines exist.
+    """
+    bin_img = robust_binarize(gray)
+    inv = 255 - bin_img
+
+    h, w = inv.shape
+    k_w = max(45, w // 22)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, 1))
+
+    horiz = cv2.morphologyEx(inv, cv2.MORPH_OPEN, kernel, iterations=2)
+    horiz = cv2.dilate(horiz, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1)), iterations=1)
+
+    proj = np.sum(horiz > 0, axis=1).astype(np.float32)
+    if proj.max() <= 0:
+        return []
+
+    proj_n = proj / proj.max()
+    candidates = np.where(proj_n >= ROW_LINE_PROJ_THRESH)[0].tolist()
+    if not candidates:
+        return []
+
+    # group consecutive rows into single y
+    lines = []
+    start = candidates[0]
+    prev = candidates[0]
+    for y in candidates[1:]:
+        if y == prev + 1:
+            prev = y
+        else:
+            lines.append(int((start + prev) / 2))
+            start = y
+            prev = y
+    lines.append(int((start + prev) / 2))
+
+    return group_nearby_positions(lines, merge_dist=ROW_LINE_MERGE_DIST)
+
+def pick_anchor_line(lines: list, y_prior: int, max_delta: int) -> int:
+    """
+    Pick the detected line closest to y_prior, but require it's within max_delta.
+    """
+    if not lines:
+        return -1
+    best = min(lines, key=lambda y: abs(y - y_prior))
+    if abs(best - y_prior) > max_delta:
+        return -1
+    return int(best)
+
+def build_uniform_row_boundaries(lines: list, img_h: int) -> (list, dict):
+    """
+    Use 2 anchors (top, bottom) and enforce exactly 40 uniform rows between them.
+    Returns (boundaries, debug).
+    """
+    debug = {
+        "top_prior": int(FIRST_ROW_Y_PRIOR),
+        "bottom_prior": int(BOTTOM_TABLE_Y_PRIOR),
+        "lines_count": int(len(lines)),
+        "top_anchor": None,
+        "bottom_anchor": None,
+        "method": None
     }
-    
-    # YOUR EXACT STARTING POINT
-    first_row_y = 1263
-    expected_row_height = 78
-    num_rows = 40
-    
-    print("Using your exact parameters:")
-    print(f"First row: y={first_row_y}")
-    print(f"Expected row height: {expected_row_height}px")
-    print(f"Target: {num_rows} rows")
-    
-    print("\nColumns being extracted:")
-    for col_name, (x1, x2) in columns.items():
-        print(f"  {col_name}: x={x1} to x={x2} (width: {x2-x1}px)")
-    
-    # Step 1: Find ACTUAL row boundaries using improved detection
-    print("\nFinding actual row boundaries with improved adaptive detection...")
-    row_boundaries = find_smart_row_boundaries(original, first_row_y, expected_row_height, num_rows)
-    
-    print(f"Found {len(row_boundaries) - 1} rows")
-    
-    # Step 2: Extract cells with head filtering
-    cells = []
-    head_rows_indices = []
-    os.makedirs('data/extracted_cells', exist_ok=True)
-    
-    # Create separate folders for head vs non-head rows
-    head_output_dir = 'data/extracted_cells/head_rows'
-    non_head_output_dir = 'data/extracted_cells/non_head_rows'
-    os.makedirs(head_output_dir, exist_ok=True)
-    os.makedirs(non_head_output_dir, exist_ok=True)
-    
-    for row_idx in range(len(row_boundaries) - 1):
-        y1, y2 = row_boundaries[row_idx], row_boundaries[row_idx + 1]
-        actual_height = y2 - y1
-        
-        # Extract head column to check for 'o'
-        head_cell_img = original[y1:y2, 1889:2204]
-        
-        # Detect head indicator
-        is_head = detect_head_indicator(head_cell_img)
-        
-        # Choose output directory based on head status
-        output_dir = head_output_dir if is_head else non_head_output_dir
-        
-        if is_head:
-            head_rows_indices.append(row_idx)
-            print(f"Row {row_idx}: HEAD (y={y1}-{y2}, height={actual_height}px)")
-        else:
-            print(f"Row {row_idx}: not head (y={y1}-{y2}, height={actual_height}px)")
-        
-        # Extract ALL columns for this row
-        for col_name, (x1, x2) in columns.items():
-            cell_img = original[y1:y2, x1:x2]
-            
-            if cell_img.size > 0:
-                # Create filename indicating head status
-                head_prefix = "HEAD_" if is_head else ""
-                filename = f"{head_prefix}row{row_idx:02d}_{col_name}.png"
-                cv2.imwrite(f'{output_dir}/{filename}', cell_img)
-                
-                # For head rows, also add to cells list for visualization
-                if is_head:
-                    cells.append((x1, y1, x2, y2, row_idx, col_name, actual_height, is_head))
-    
-    print(f"\n✅ Extraction complete!")
-    print(f"Head rows found: {len(head_rows_indices)}")
-    print(f"Non-head rows: {len(row_boundaries) - 1 - len(head_rows_indices)}")
-    print(f"Total cells extracted from head rows: {len(head_rows_indices) * len(columns)}")
-    
-    # Create visualization
-    create_smart_visualization(original, columns, row_boundaries, cells, head_rows_indices)
-    
-    # Create summary report
-    create_extraction_report(columns, head_rows_indices, row_boundaries)
-    
-    return len(head_rows_indices), len(columns)
 
-def detect_head_indicator(head_cell_image):
-    """Detect if 'o' is present in head column"""
-    
-    height, width = head_cell_image.shape
-    
-    # Check if cell has content (not empty)
-    black_pixels = np.count_nonzero(head_cell_image == 0)
-    total_pixels = height * width
-    black_percentage = (black_pixels / total_pixels) * 100
-    
-    # 'o' typically has moderate black percentage
-    # Adjust these thresholds based on your actual data
-    if 10 < black_percentage < 40:  # 'o' usually has moderate ink density
-        return True
-    
-    return False
+    top = pick_anchor_line(lines, FIRST_ROW_Y_PRIOR, TOP_ANCHOR_MAX_DELTA)
+    bottom = pick_anchor_line(lines, BOTTOM_TABLE_Y_PRIOR, BOTTOM_ANCHOR_MAX_DELTA)
 
-def find_smart_row_boundaries(image, start_y, expected_height, target_rows):
-    """Find row boundaries that adapt to each row"""
-    
-    height, width = image.shape
-    boundaries = [start_y]
-    current_y = start_y
-    
-    # Use the entire width for row detection (more robust)
-    for row_num in range(target_rows):
-        # Calculate search region for this row
-        search_start = current_y
-        search_end = min(current_y + expected_height * 2, height - 1)
-        
-        if search_start >= height:
-            break
-            
-        # Look for the optimal row bottom using improved method
-        optimal_bottom = find_optimal_row_bottom_improved(image, search_start, search_end, expected_height)
-        
-        if optimal_bottom is None:
-            # Fallback: use expected height
-            optimal_bottom = current_y + expected_height
-        
-        # Ensure reasonable gap between rows
-        gap = optimal_bottom - current_y
-        min_gap = expected_height * 0.6
-        max_gap = expected_height * 1.4
-        
-        if gap < min_gap:
-            optimal_bottom = current_y + expected_height
-        elif gap > max_gap:
-            optimal_bottom = current_y + expected_height
-        
-        boundaries.append(optimal_bottom)
-        current_y = optimal_bottom
-    
-    return boundaries
+    # If bottom mistakenly picked above top (rare but possible), invalidate
+    if top != -1 and bottom != -1 and bottom <= top + 200:
+        bottom = -1
 
-def find_optimal_row_bottom_improved(image, start_y, end_y, expected_height):
-    """Improved method to find the best bottom boundary for a row"""
-    
-    # Extract the search region
-    search_region = image[start_y:end_y, :]
-    if search_region.size == 0:
-        return None
-    
-    # Calculate horizontal projection
-    horizontal_proj = np.sum(search_region == 0, axis=1)
-    
-    # Smooth the projection to reduce noise
-    kernel_size = 10
-    kernel = np.ones(kernel_size) / kernel_size
-    smoothed_proj = np.convolve(horizontal_proj, kernel, mode='same')
-    
-    # Look for the natural break point (valley in projection)
-    # We expect the break to be around the expected_height
-    search_center = expected_height
-    search_window = 30  # Look ±30 pixels around expected height
-    
-    search_start = max(0, search_center - search_window)
-    search_end = min(len(smoothed_proj), search_center + search_window)
-    
-    # Find the minimum in this window (the valley between rows)
-    if search_end > search_start:
-        window_proj = smoothed_proj[search_start:search_end]
-        
-        # Find all local minima
-        minima_positions = []
-        for i in range(1, len(window_proj) - 1):
-            if window_proj[i] < window_proj[i-1] and window_proj[i] < window_proj[i+1]:
-                minima_positions.append(i)
-        
-        if minima_positions:
-            # Choose the deepest minimum (lowest value)
-            min_values = [window_proj[pos] for pos in minima_positions]
-            deepest_min_idx = minima_positions[np.argmin(min_values)]
-            optimal_pos = search_start + deepest_min_idx
-        else:
-            # Fallback: find global minimum in window
-            min_pos = np.argmin(window_proj)
-            optimal_pos = search_start + min_pos
+    if top != -1 and bottom != -1:
+        debug["top_anchor"] = int(top)
+        debug["bottom_anchor"] = int(bottom)
+        debug["method"] = "uniform_between_anchors"
+
+        table_height = bottom - top
+        row_h = table_height / NUM_ROWS
+
+        boundaries = [int(round(top + i * row_h)) for i in range(NUM_ROWS + 1)]
+        boundaries[0] = max(0, min(img_h - 1, boundaries[0]))
+        boundaries[-1] = max(0, min(img_h - 1, boundaries[-1]))
+
+        # enforce strictly increasing
+        fixed = [boundaries[0]]
+        for b in boundaries[1:]:
+            if b <= fixed[-1]:
+                b = fixed[-1] + 1
+            fixed.append(min(int(b), img_h - 1))
+
+        return fixed, debug
+
+    # Fallback: uniform from priors only (still consistent spacing, but less accurate anchors)
+    debug["method"] = "uniform_from_priors_fallback"
+    top_f = max(0, min(img_h - 1, FIRST_ROW_Y_PRIOR))
+    bottom_f = max(0, min(img_h - 1, BOTTOM_TABLE_Y_PRIOR))
+    if bottom_f <= top_f + 200:
+        bottom_f = min(img_h - 1, top_f + int(EXPECTED_ROW_HEIGHT * NUM_ROWS))
+
+    debug["top_anchor"] = int(top_f)
+    debug["bottom_anchor"] = int(bottom_f)
+
+    table_height = bottom_f - top_f
+    row_h = table_height / NUM_ROWS
+    boundaries = [int(round(top_f + i * row_h)) for i in range(NUM_ROWS + 1)]
+
+    fixed = [boundaries[0]]
+    for b in boundaries[1:]:
+        if b <= fixed[-1]:
+            b = fixed[-1] + 1
+        fixed.append(min(int(b), img_h - 1))
+
+    return fixed, debug
+
+
+# ============================================================
+# Head detection (rented/owned ink)
+# ============================================================
+
+def remove_table_lines(ink_mask: np.ndarray) -> np.ndarray:
+    h, w = ink_mask.shape
+
+    hk = max(20, w // 14)
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hk, 1))
+    horiz = cv2.morphologyEx(ink_mask, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
+
+    vk = max(25, h // 2)
+    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vk))
+    vert = cv2.morphologyEx(ink_mask, cv2.MORPH_OPEN, vert_kernel, iterations=1)
+
+    lines = cv2.bitwise_or(horiz, vert)
+    return cv2.bitwise_and(ink_mask, cv2.bitwise_not(lines))
+
+def cell_has_ink(cell_gray: np.ndarray,
+                 pad: int = INK_PAD,
+                 min_ink_ratio: float = MIN_INK_RATIO,
+                 min_cc_area: int = MIN_CC_AREA) -> bool:
+    if cell_gray is None or cell_gray.size == 0:
+        return False
+
+    h, w = cell_gray.shape
+    if h <= 2 * pad or w <= 2 * pad:
+        return False
+
+    roi = cell_gray[pad:h - pad, pad:w - pad]
+    bin_img = robust_binarize(roi)
+    ink = 255 - bin_img
+
+    ink = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
+        iterations=1
+    )
+
+    ink = remove_table_lines(ink)
+
+    ink_pixels = int(np.count_nonzero(ink > 0))
+    total = int(ink.size)
+    if total == 0:
+        return False
+
+    ink_ratio = ink_pixels / total
+    if ink_ratio < min_ink_ratio:
+        return False
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats((ink > 0).astype(np.uint8), connectivity=8)
+    if num_labels <= 1:
+        return False
+
+    largest_area = int(stats[1:, cv2.CC_STAT_AREA].max())
+    return largest_area >= min_cc_area
+
+def detect_head_row_from_tenure_cols(row_img_gray: np.ndarray,
+                                     rented_x1: int, rented_x2: int,
+                                     owned_x1: int, owned_x2: int):
+    rented_cell = row_img_gray[:, rented_x1:rented_x2]
+    owned_cell = row_img_gray[:, owned_x1:owned_x2]
+
+    is_rented = cell_has_ink(rented_cell)
+    is_owned = cell_has_ink(owned_cell)
+
+    is_head = bool(is_rented or is_owned)
+    if is_rented and not is_owned:
+        tenure = "RENTED"
+    elif is_owned and not is_rented:
+        tenure = "OWNED"
+    elif is_rented and is_owned:
+        tenure = "BOTH_UNCLEAR"
     else:
-        optimal_pos = expected_height
-    
-    return start_y + optimal_pos
+        tenure = "NONE"
 
-def create_smart_visualization(image, columns, row_boundaries, cells, head_rows_indices):
-    """Create visualization showing the smart grid"""
-    viz = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    
-    # Draw column boundaries (blue)
+    return is_head, tenure, {"is_rented": bool(is_rented), "is_owned": bool(is_owned)}
+
+
+# ============================================================
+# Visualization + extraction
+# ============================================================
+
+def draw_grid_overlay(gray: np.ndarray,
+                      columns: dict,
+                      row_boundaries: list,
+                      head_rows: list,
+                      head_row_tenure: dict,
+                      out_path: str,
+                      title: str = "") -> None:
+    viz = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    h, w = gray.shape
+
+    if title:
+        cv2.putText(viz, title, (40, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 180, 0), 2)
+
+    # Columns
     for col_name, (x1, x2) in columns.items():
-        cv2.line(viz, (x1, 0), (x1, image.shape[0]), (255, 0, 0), 3)
-        cv2.line(viz, (x2, 0), (x2, image.shape[0]), (255, 0, 0), 3)
-        cv2.putText(viz, col_name, (x1, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-    
-    # Draw row boundaries (red)
+        cv2.line(viz, (x1, 0), (x1, h), (255, 0, 0), 2)
+        cv2.line(viz, (x2, 0), (x2, h), (255, 0, 0), 2)
+        cv2.putText(viz, col_name, (x1, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2)
+
+    # Rows
     for i, y in enumerate(row_boundaries):
-        cv2.line(viz, (0, y), (image.shape[1], y), (0, 0, 255), 3)
+        is_head = i in head_rows
+        color = (0, 255, 0) if is_head else (0, 0, 255)
+        thick = 3 if is_head else 2
+        cv2.line(viz, (0, y), (w, y), color, thick)
+
         if i < len(row_boundaries) - 1:
-            row_height = row_boundaries[i+1] - y
-            # Highlight head rows with different color
-            if i in head_rows_indices:
-                cv2.putText(viz, f"HEAD Row {i}", (50, y + 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            rh = row_boundaries[i + 1] - y
+            if is_head:
+                tenure = head_row_tenure.get(i, "HEAD")
+                label = f"HEAD {i} [{tenure}] ({rh}px)"
+                cv2.putText(viz, label, (40, y + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 0), 2)
             else:
-                cv2.putText(viz, f"Row {i} ({row_height}px)", (50, y + 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
-    
-    # Draw head cells (green highlight)
-    for x1, y1, x2, y2, row_idx, col_name, row_height, is_head in cells:
+                cv2.putText(viz, f"Row {i} ({rh}px)", (40, y + 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1)
+
+    ensure_dir(os.path.dirname(out_path))
+    cv2.imwrite(out_path, viz)
+
+def extract_cells_for_image(gray: np.ndarray,
+                            columns: dict,
+                            row_boundaries: list,
+                            head_rows: list,
+                            head_row_tenure: dict,
+                            out_dir: str) -> None:
+    head_dir = os.path.join(out_dir, "head_rows")
+    non_dir = os.path.join(out_dir, "non_head_rows")
+    ensure_dir(head_dir)
+    ensure_dir(non_dir)
+
+    rows_found = len(row_boundaries) - 1
+    for row_idx in range(rows_found):
+        y1, y2 = row_boundaries[row_idx], row_boundaries[row_idx + 1]
+        is_head = row_idx in head_rows
+        tenure = head_row_tenure.get(row_idx, "NONE")
+        out = head_dir if is_head else non_dir
+
+        for col_name, (x1, x2) in columns.items():
+            cell = gray[y1:y2, x1:x2]
+            if cell.size == 0:
+                continue
+            prefix = f"HEAD_{tenure}_" if is_head else ""
+            fname = f"{prefix}row{row_idx:02d}_{col_name}.png"
+            cv2.imwrite(os.path.join(out, fname), cell)
+
+def save_report_json(out_path: str, payload: dict) -> None:
+    ensure_dir(os.path.dirname(out_path))
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def process_one_image(img_path: str) -> None:
+    name = os.path.splitext(os.path.basename(img_path))[0]
+    print(f"\n=== Processing: {name} ===")
+
+    gray = read_gray(img_path)
+    if gray is None:
+        print("⚠️ Could not read image. Skipping.")
+        return
+
+    # Deskew
+    angle = estimate_skew_angle_degrees(gray)
+    gray_ds = rotate_image(gray, -angle)
+
+    # Detect horizontal lines, then build uniform 40-row boundaries
+    lines = detect_horizontal_lines(gray_ds)
+    row_boundaries, debug_rows = build_uniform_row_boundaries(lines, gray_ds.shape[0])
+    rows_found = len(row_boundaries) - 1
+
+    print(f"deskew_angle={angle:.3f}deg | lines={len(lines)} | rows={rows_found} | row_method={debug_rows['method']}")
+    print(f"anchors: top={debug_rows['top_anchor']} bottom={debug_rows['bottom_anchor']} (priors top={FIRST_ROW_Y_PRIOR} bottom={BOTTOM_TABLE_Y_PRIOR})")
+
+    # Head detection
+    rented_x1, rented_x2 = COLUMNS["rented"]
+    owned_x1, owned_x2 = COLUMNS["owned"]
+
+    head_rows = []
+    head_row_tenure = {}
+
+    for row_idx in range(rows_found):
+        y1, y2 = row_boundaries[row_idx], row_boundaries[row_idx + 1]
+        row_img = gray_ds[y1:y2, :]
+        is_head, tenure, dbg = detect_head_row_from_tenure_cols(row_img, rented_x1, rented_x2, owned_x1, owned_x2)
+
         if is_head:
-            cv2.rectangle(viz, (x1, y1), (x2, y2), (0, 255, 0), 3)
-    
-    cv2.imwrite('data/processed/smart_adaptive_grid.png', viz)
-    print("Visualization saved: data/processed/smart_adaptive_grid.png")
-    
-    # Create zoomed version for head rows
-    if head_rows_indices:
-        # Zoom on first head row
-        first_head_row = head_rows_indices[0]
-        y1, y2 = row_boundaries[first_head_row], row_boundaries[first_head_row + 1]
-        zoom_region = (0, max(0, y1-100), image.shape[1], min(image.shape[0], y2+100))
-        zoomed = viz[zoom_region[1]:zoom_region[3], zoom_region[0]:zoom_region[2]]
-        cv2.imwrite('data/processed/head_row_zoom.png', zoomed)
-        print("Head row zoom saved: data/processed/head_row_zoom.png")
+            head_rows.append(row_idx)
+            head_row_tenure[row_idx] = tenure
 
-def create_extraction_report(columns, head_rows_indices, row_boundaries):
-    """Create a detailed extraction report"""
-    
-    report = f"""=== SMART ADAPTIVE EXTRACTION REPORT ===
+    # Output
+    img_out = os.path.join(OUTPUT_DIR, name)
+    ensure_dir(img_out)
 
-EXTRACTION PARAMETERS:
-- First row Y position: {row_boundaries[0]}
-- Number of rows extracted: {len(row_boundaries) - 1}
-- Head rows detected: {len(head_rows_indices)}
+    if SAVE_VIZ:
+        viz_path = os.path.join(img_out, "grid_overlay.png")
+        title = f"{name} | deskew={angle:.2f}deg | rows={rows_found} | head={len(head_rows)} | {debug_rows['method']}"
+        draw_grid_overlay(gray_ds, COLUMNS, row_boundaries, head_rows, head_row_tenure, viz_path, title=title)
+        print(f"✅ Grid visualization saved: {viz_path}")
 
-COLUMNS EXTRACTED:
-"""
-    
-    for col_name, (x1, x2) in columns.items():
-        report += f"- {col_name}: x={x1}-{x2} (width: {x2-x1}px)\n"
-    
-    report += f"\nHEAD ROWS INDICES: {head_rows_indices}\n"
-    
-    report += f"""
-OUTPUT STRUCTURE:
-- Head rows: data/extracted_cells/head_rows/
-- Non-head rows: data/extracted_cells/non_head_rows/
-- Visualizations: data/processed/
+    if SAVE_CELLS:
+        extract_cells_for_image(gray_ds, COLUMNS, row_boundaries, head_rows, head_row_tenure, img_out)
+        print(f"✅ Cells saved under: {img_out}/head_rows and {img_out}/non_head_rows")
 
-FILENAMING CONVENTION:
-- HEAD_row00_house_number.png
-- HEAD_row00_rented_owned.png
-- etc.
+    report = {
+        "image_name": name,
+        "source_path": img_path,
+        "image_shape_original": {"h": int(gray.shape[0]), "w": int(gray.shape[1])},
+        "image_shape_deskewed": {"h": int(gray_ds.shape[0]), "w": int(gray_ds.shape[1])},
+        "deskew_angle_deg_estimated": float(angle),
+        "row_detection": debug_rows,
+        "detected_line_ys": [int(y) for y in lines],
+        "rows_found": int(rows_found),
+        "columns": {k: {"x1": int(v[0]), "x2": int(v[1])} for k, v in COLUMNS.items()},
+        "row_boundaries": [int(y) for y in row_boundaries],
+        "head_rows": [{"row_idx": int(i), "tenure": head_row_tenure.get(i, "NONE")} for i in head_rows],
+        "head_rows_count": int(len(head_rows)),
+        "ink_detection": {
+            "pad": int(INK_PAD),
+            "min_ink_ratio": float(MIN_INK_RATIO),
+            "min_cc_area": int(MIN_CC_AREA),
+        },
+        "notes": [
+            "Row spacing is enforced uniformly between detected top/bottom table anchors.",
+            "Head row count is NOT a quality metric (some pages have 0 or 1 head rows).",
+        ],
+    }
+    save_report_json(os.path.join(img_out, "report.json"), report)
+    print(f"✅ Report saved: {os.path.join(img_out, 'report.json')}")
 
-NEXT STEPS:
-1. Verify head detection accuracy
-2. Map Excel data to extracted cells
-3. Adjust column coordinates if needed
-"""
-    
-    with open('data/processed/smart_extraction_report.txt', 'w') as f:
-        f.write(report)
-    
-    print("Report saved: data/processed/smart_extraction_report.txt")
+
+def main():
+    ensure_dir(OUTPUT_DIR)
+
+    imgs = list_images(INPUT_DIR)
+    if not imgs:
+        print(f"❌ No images found in: {INPUT_DIR}")
+        return
+
+    print("=== SMART ADAPTIVE EXTRACTION v3 (DESKEW + UNIFORM 40 ROWS) ===")
+    print(f"Input:  {INPUT_DIR}")
+    print(f"Output: {OUTPUT_DIR}")
+    print(f"Images found: {len(imgs)}")
+
+    for i, p in enumerate(imgs, start=1):
+        print(f"\n[{i}/{len(imgs)}]")
+        process_one_image(p)
+
+    print("\n🎯 DONE")
+
 
 if __name__ == "__main__":
-    head_rows, num_columns = smart_adaptive_extraction()
-    print(f"\n🎯 SMART ADAPTIVE EXTRACTION FINISHED!")
-    print(f"Extracted {head_rows} head rows × {num_columns} columns")
-    print(f"Total: {head_rows * num_columns} cells from head rows")
-    print(f"\n📁 Check data/extracted_cells/head_rows/ for the important data")
-    print(f"📊 Check data/processed/smart_extraction_report.txt for details")
+    main()
