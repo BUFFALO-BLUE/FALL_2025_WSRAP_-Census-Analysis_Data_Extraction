@@ -9,28 +9,25 @@ import numpy as np
 # ============================================================
 
 INPUT_DIR = "data/from_jeremy/images_aligned_to_first"
-OUTPUT_DIR = "data/processed/smart_adaptive_extraction_batch_v4"
+OUTPUT_DIR = "data/processed/smart_adaptive_extraction_batch_v6"
 
 NUM_ROWS = 40
-
-# Priors (used to find first boundary + expected spacing for chaining)
 FIRST_ROW_Y_PRIOR = 1263
 EXPECTED_ROW_HEIGHT = 78
 
-# Column coordinates (leave as-is for now; we’ll fix column alignment AFTER you verify rows)
+# 🚧 Hard fence so row detection can’t leak into the bottom “general info” section
+# You measured ~3160px from the top table line to the bottom table line.
+TABLE_HEIGHT_PX = 3160
+TABLE_HEIGHT_MARGIN = 220  # allow scan variation
+
+# Column coordinates (fixed for now; we’ll do column alignment later)
 COLUMNS = {
     "street": (629, 718),
     "house_number": (718, 836),
-
-    # adjust if needed
     "rented": (914, 954),
     "owned":  (954, 994),
-
     "price_rent": (996, 1143),
-
-    # kept as data, NOT used for head detection
     "head": (1889, 2204),
-
     "gender": (2204, 2285),
     "race": (2285, 2388),
     "marital_status": (2491, 2574),
@@ -40,16 +37,24 @@ COLUMNS = {
 
 SAVE_VIZ = True
 SAVE_CELLS = True
+SAVE_ROW_STRENGTH_DEBUG = False  # set True if you want debug plots per image
 
-# Ink detection knobs (tune later if needed)
+# Head/ink detection knobs
 INK_PAD = 12
 MIN_INK_RATIO = 0.010
 MIN_CC_AREA = 60
 
-# Row-line chaining knobs
-PEAK_MIN_PROMINENCE = 0.15     # relative to max line strength
+# Row-line peak detection knobs
+# We'll adaptively relax prominence ONLY inside the first-line ROI if needed.
+PEAK_MIN_PROMINENCE_START = 0.18
+PEAK_MIN_PROMINENCE_MIN = 0.06
 PEAK_MERGE_DIST = 6
-FIRST_LINE_MAX_DELTA = 250
+
+# Critical: restrict first-line search to ROI band near expected top
+FIRST_LINE_ROI_UP = 260     # pixels above FIRST_ROW_Y_PRIOR
+FIRST_LINE_ROI_DOWN = 520   # pixels below FIRST_ROW_Y_PRIOR
+
+# Chaining constraints (row-to-row)
 CHAIN_WINDOW = 28
 CHAIN_MIN_STEP = 45
 CHAIN_MAX_STEP = 120
@@ -86,14 +91,10 @@ def robust_binarize(gray: np.ndarray) -> np.ndarray:
 
 
 # ============================================================
-# Deskew
+# Deskew (OpenCV)
 # ============================================================
 
 def estimate_skew_angle_degrees(gray: np.ndarray) -> float:
-    """
-    Estimate skew using long horizontal table lines via HoughLinesP.
-    Returns angle in degrees (near 0 if already straight).
-    """
     bin_img = robust_binarize(gray)
     inv = 255 - bin_img
 
@@ -146,13 +147,10 @@ def rotate_image(gray: np.ndarray, angle_deg: float) -> np.ndarray:
 
 
 # ============================================================
-# Row boundary detection: detect 41 REAL separator lines (peak chaining)
+# Row boundary detection: peak chaining with strict first-line ROI + bottom fence
 # ============================================================
 
 def horizontal_line_strength(gray: np.ndarray) -> np.ndarray:
-    """
-    Returns strength[y] measuring how 'line-like' each y is.
-    """
     bin_img = robust_binarize(gray)
     inv = 255 - bin_img
 
@@ -170,11 +168,7 @@ def horizontal_line_strength(gray: np.ndarray) -> np.ndarray:
     strength = np.convolve(strength, np.ones(k, dtype=np.float32) / k, mode="same")
     return strength
 
-def find_line_peaks(strength: np.ndarray, min_prominence: float = PEAK_MIN_PROMINENCE) -> list:
-    """
-    Find local maxima peaks in strength.
-    min_prominence is relative to max strength.
-    """
+def find_line_peaks(strength: np.ndarray, min_prominence: float) -> list:
     if strength.size == 0 or float(strength.max()) <= 0:
         return []
 
@@ -184,7 +178,7 @@ def find_line_peaks(strength: np.ndarray, min_prominence: float = PEAK_MIN_PROMI
         if s[y] > s[y - 1] and s[y] > s[y + 1] and s[y] >= min_prominence:
             peaks.append(y)
 
-    # merge peaks too close, keep stronger
+    # merge too-close peaks, keep stronger
     merged = []
     for p in peaks:
         if not merged or abs(p - merged[-1]) > PEAK_MERGE_DIST:
@@ -194,41 +188,55 @@ def find_line_peaks(strength: np.ndarray, min_prominence: float = PEAK_MIN_PROMI
                 merged[-1] = p
     return merged
 
-def pick_first_line(peaks: list, strength: np.ndarray, first_y_prior: int, max_delta: int = FIRST_LINE_MAX_DELTA) -> int:
+def pick_first_line_strict_roi(peaks: list, strength: np.ndarray, first_y_prior: int) -> (int, dict):
     """
-    Pick the line peak closest to the prior start.
-    If none within max_delta, pick strongest peak in a broad band around the prior.
+    ONLY pick the first line inside a strict ROI around the prior.
+    If weak, relax prominence in ROI only.
+    If still none, fallback to prior (NOT bottom-of-page).
     """
-    if not peaks:
-        return -1
+    h = len(strength)
+    roi_lo = max(0, first_y_prior - FIRST_LINE_ROI_UP)
+    roi_hi = min(h - 1, first_y_prior + FIRST_LINE_ROI_DOWN)
 
-    near = [p for p in peaks if abs(p - first_y_prior) <= max_delta]
-    if near:
-        return int(min(near, key=lambda p: abs(p - first_y_prior)))
+    debug = {
+        "roi_lo": int(roi_lo),
+        "roi_hi": int(roi_hi),
+        "picked_from": None,
+        "used_prominence": None,
+        "fallback_to_prior": False,
+    }
 
-    lo = max(0, first_y_prior - 400)
-    hi = min(len(strength) - 1, first_y_prior + 400)
-    band = [p for p in peaks if lo <= p <= hi]
-    if band:
-        return int(max(band, key=lambda p: strength[p]))
+    for prom in np.linspace(PEAK_MIN_PROMINENCE_START, PEAK_MIN_PROMINENCE_MIN, num=5):
+        prom = float(prom)
+        pks = find_line_peaks(strength, min_prominence=prom)
+        roi_peaks = [p for p in pks if roi_lo <= p <= roi_hi]
+        if roi_peaks:
+            first = int(max(roi_peaks, key=lambda p: strength[p]))
+            debug["picked_from"] = "roi_strongest"
+            debug["used_prominence"] = prom
+            return first, debug
 
-    return int(max(peaks, key=lambda p: strength[p]))
+    debug["picked_from"] = "prior_fallback"
+    debug["used_prominence"] = None
+    debug["fallback_to_prior"] = True
+    return int(first_y_prior), debug
 
 def pick_next_lines(peaks: list,
                     strength: np.ndarray,
                     first_line_y: int,
                     num_rows: int,
                     expected_row_height: int,
-                    window: int = CHAIN_WINDOW,
-                    min_step: int = CHAIN_MIN_STEP,
-                    max_step: int = CHAIN_MAX_STEP) -> list:
+                    table_height_px: int = TABLE_HEIGHT_PX,
+                    table_height_margin: int = TABLE_HEIGHT_MARGIN) -> list:
     """
-    After first boundary, pick next num_rows boundaries by searching around expected height each time.
-    Chooses strongest peak inside the valid window.
-    Returns boundaries list length num_rows+1.
+    Chain the next lines, but NEVER allow detection past the table bottom.
+    Prevents leaking into general-info section below the people table.
     """
     if first_line_y < 0:
         return []
+
+    # 🚧 hard bottom fence (table ends around here)
+    table_bottom_limit = int(first_line_y + table_height_px + table_height_margin)
 
     boundaries = [int(first_line_y)]
     current = int(first_line_y)
@@ -236,69 +244,96 @@ def pick_next_lines(peaks: list,
     for _ in range(num_rows):
         target = current + expected_row_height
 
-        lo = target - window
-        hi = target + window
+        lo = max(target - CHAIN_WINDOW, current + CHAIN_MIN_STEP)
+        hi = min(target + CHAIN_WINDOW, current + CHAIN_MAX_STEP)
 
-        lo = max(lo, current + min_step)
-        hi = min(hi, current + max_step)
+        # 🚧 apply bottom fence
+        hi = min(hi, table_bottom_limit)
+        if lo > table_bottom_limit:
+            break
 
         candidates = [p for p in peaks if lo <= p <= hi]
 
         if not candidates:
-            # fallback: broaden slightly
-            lo2 = current + min_step
-            hi2 = min(len(strength) - 1, current + max_step + 60)
-            candidates = [p for p in peaks if lo2 <= p <= hi2]
+            # broaden a bit, still fenced
+            lo2 = current + CHAIN_MIN_STEP
+            hi2 = min(len(strength) - 1, current + CHAIN_MAX_STEP + 50, table_bottom_limit)
+            if lo2 <= hi2:
+                candidates = [p for p in peaks if lo2 <= p <= hi2]
 
         if candidates:
             nxt = int(max(candidates, key=lambda p: strength[p]))
         else:
-            nxt = int(current + expected_row_height)
+            nxt = int(min(current + expected_row_height, table_bottom_limit))
+
+        if nxt <= current + 2:
+            break
 
         boundaries.append(nxt)
         current = nxt
 
-    # enforce strictly increasing
+        if current >= table_bottom_limit:
+            break
+
+    # Fill missing boundaries conservatively, but don't cross the fence
+    while len(boundaries) < num_rows + 1:
+        nxt = int(min(boundaries[-1] + expected_row_height, table_bottom_limit))
+        if nxt <= boundaries[-1] + 2:
+            break
+        boundaries.append(nxt)
+
+    # strictly increasing
     fixed = [boundaries[0]]
     for b in boundaries[1:]:
         if b <= fixed[-1]:
             b = fixed[-1] + 1
         fixed.append(int(b))
 
+    # final clamp to fence
+    fixed = [min(int(y), table_bottom_limit) for y in fixed]
+
     return fixed
 
 def detect_41_boundaries(gray: np.ndarray, first_row_y_prior: int, num_rows: int, expected_row_height: int):
     strength = horizontal_line_strength(gray)
-    peaks = find_line_peaks(strength, min_prominence=PEAK_MIN_PROMINENCE)
-    first = pick_first_line(peaks, strength, first_row_y_prior, max_delta=FIRST_LINE_MAX_DELTA)
+
+    # peaks for chaining
+    peaks = find_line_peaks(strength, min_prominence=PEAK_MIN_PROMINENCE_MIN)
+
+    first, first_debug = pick_first_line_strict_roi(peaks, strength, first_row_y_prior)
+
     boundaries = pick_next_lines(
-        peaks, strength, first,
+        peaks=peaks,
+        strength=strength,
+        first_line_y=first,
         num_rows=num_rows,
         expected_row_height=expected_row_height,
-        window=CHAIN_WINDOW,
-        min_step=CHAIN_MIN_STEP,
-        max_step=CHAIN_MAX_STEP
+        table_height_px=TABLE_HEIGHT_PX,
+        table_height_margin=TABLE_HEIGHT_MARGIN
     )
 
     debug = {
-        "method": "peak_chain",
+        "method": "peak_chain_strict_first_roi_bottom_fence",
         "peaks_count": int(len(peaks)),
         "first_line": int(first),
+        "first_line_debug": first_debug,
         "expected_row_height": int(expected_row_height),
-        "window": int(CHAIN_WINDOW),
-        "min_step": int(CHAIN_MIN_STEP),
-        "max_step": int(CHAIN_MAX_STEP),
+        "chain_window": int(CHAIN_WINDOW),
+        "chain_min_step": int(CHAIN_MIN_STEP),
+        "chain_max_step": int(CHAIN_MAX_STEP),
+        "table_height_px": int(TABLE_HEIGHT_PX),
+        "table_height_margin": int(TABLE_HEIGHT_MARGIN),
+        "table_bottom_limit": int(first + TABLE_HEIGHT_PX + TABLE_HEIGHT_MARGIN),
     }
-    return boundaries, debug
+    return boundaries, debug, strength
 
 
 # ============================================================
-# Head detection (rented/owned ink) — unchanged
+# Head detection (rented/owned ink)
 # ============================================================
 
 def remove_table_lines(ink_mask: np.ndarray) -> np.ndarray:
     h, w = ink_mask.shape
-
     hk = max(20, w // 14)
     horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hk, 1))
     horiz = cv2.morphologyEx(ink_mask, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
@@ -310,18 +345,15 @@ def remove_table_lines(ink_mask: np.ndarray) -> np.ndarray:
     lines = cv2.bitwise_or(horiz, vert)
     return cv2.bitwise_and(ink_mask, cv2.bitwise_not(lines))
 
-def cell_has_ink(cell_gray: np.ndarray,
-                 pad: int = INK_PAD,
-                 min_ink_ratio: float = MIN_INK_RATIO,
-                 min_cc_area: int = MIN_CC_AREA) -> bool:
+def cell_has_ink(cell_gray: np.ndarray) -> bool:
     if cell_gray is None or cell_gray.size == 0:
         return False
 
     h, w = cell_gray.shape
-    if h <= 2 * pad or w <= 2 * pad:
+    if h <= 2 * INK_PAD or w <= 2 * INK_PAD:
         return False
 
-    roi = cell_gray[pad:h - pad, pad:w - pad]
+    roi = cell_gray[INK_PAD:h - INK_PAD, INK_PAD:w - INK_PAD]
     bin_img = robust_binarize(roi)
     ink = 255 - bin_img
 
@@ -331,7 +363,6 @@ def cell_has_ink(cell_gray: np.ndarray,
         cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
         iterations=1
     )
-
     ink = remove_table_lines(ink)
 
     ink_pixels = int(np.count_nonzero(ink > 0))
@@ -340,7 +371,7 @@ def cell_has_ink(cell_gray: np.ndarray,
         return False
 
     ink_ratio = ink_pixels / total
-    if ink_ratio < min_ink_ratio:
+    if ink_ratio < MIN_INK_RATIO:
         return False
 
     num_labels, _, stats, _ = cv2.connectedComponentsWithStats((ink > 0).astype(np.uint8), connectivity=8)
@@ -348,7 +379,7 @@ def cell_has_ink(cell_gray: np.ndarray,
         return False
 
     largest_area = int(stats[1:, cv2.CC_STAT_AREA].max())
-    return largest_area >= min_cc_area
+    return largest_area >= MIN_CC_AREA
 
 def detect_head_row_from_tenure_cols(row_img_gray: np.ndarray,
                                      rented_x1: int, rented_x2: int,
@@ -369,7 +400,7 @@ def detect_head_row_from_tenure_cols(row_img_gray: np.ndarray,
     else:
         tenure = "NONE"
 
-    return is_head, tenure, {"is_rented": bool(is_rented), "is_owned": bool(is_owned)}
+    return is_head, tenure
 
 
 # ============================================================
@@ -389,13 +420,11 @@ def draw_grid_overlay(gray: np.ndarray,
     if title:
         cv2.putText(viz, title, (40, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 180, 0), 2)
 
-    # Columns (fixed for now)
     for col_name, (x1, x2) in columns.items():
         cv2.line(viz, (x1, 0), (x1, h), (255, 0, 0), 2)
         cv2.line(viz, (x2, 0), (x2, h), (255, 0, 0), 2)
         cv2.putText(viz, col_name, (x1, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2)
 
-    # Rows (from detected 41 separators)
     for i, y in enumerate(row_boundaries):
         is_head = i in head_rows
         color = (0, 255, 0) if is_head else (0, 0, 255)
@@ -446,6 +475,29 @@ def save_report_json(out_path: str, payload: dict) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
+def save_row_strength_debug(strength: np.ndarray, out_path: str, roi_lo: int, roi_hi: int, first_line: int):
+    """
+    Saves a simple visualization of strength signal as an image.
+    White = stronger. Marks ROI + first line.
+    """
+    s = strength.copy()
+    if s.max() > 0:
+        s = s / s.max()
+    img = (s * 255).astype(np.uint8).reshape(-1, 1)
+    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    # mark ROI in blue
+    for y in range(roi_lo, roi_hi):
+        if 0 <= y < img.shape[0]:
+            img[y, 0] = (255, 0, 0)
+
+    # mark first line in green
+    if 0 <= first_line < img.shape[0]:
+        img[first_line, 0] = (0, 255, 0)
+
+    ensure_dir(os.path.dirname(out_path))
+    cv2.imwrite(out_path, img)
+
 
 # ============================================================
 # Main
@@ -460,56 +512,68 @@ def process_one_image(img_path: str) -> None:
         print("⚠️ Could not read image. Skipping.")
         return
 
-    # 1) Deskew per image
+    # Deskew
     angle = estimate_skew_angle_degrees(gray)
     gray_ds = rotate_image(gray, -angle)
 
-    # 2) Detect 41 row boundaries by chaining real horizontal separator peaks
-    row_boundaries, debug_rows = detect_41_boundaries(
+    # Detect row boundaries with strict-first-line ROI + bottom fence
+    row_boundaries, debug_rows, strength = detect_41_boundaries(
         gray_ds,
         first_row_y_prior=FIRST_ROW_Y_PRIOR,
         num_rows=NUM_ROWS,
         expected_row_height=EXPECTED_ROW_HEIGHT
     )
 
-    if not row_boundaries or len(row_boundaries) < NUM_ROWS + 1:
-        print("⚠️ Could not build 41 row boundaries. Skipping.")
+    if not row_boundaries or len(row_boundaries) < 2:
+        print("⚠️ Could not build row boundaries. Skipping.")
         return
 
-    rows_found = len(row_boundaries) - 1
     # Clamp within image
     row_boundaries = [max(0, min(gray_ds.shape[0] - 1, int(y))) for y in row_boundaries]
+    rows_found = len(row_boundaries) - 1
 
-    print(f"deskew_angle={angle:.3f}deg | rows={rows_found} | peaks={debug_rows['peaks_count']} | first_line={debug_rows['first_line']}")
+    roi_lo = debug_rows["first_line_debug"]["roi_lo"]
+    roi_hi = debug_rows["first_line_debug"]["roi_hi"]
+    first_line = debug_rows["first_line"]
+    bottom_limit = debug_rows["table_bottom_limit"]
 
-    # 3) Head detection
+    print(
+        f"deskew_angle={angle:.3f}deg | rows_found={rows_found} | peaks={debug_rows['peaks_count']} | "
+        f"first_line={first_line} | bottom_limit={bottom_limit} | first_pick={debug_rows['first_line_debug']['picked_from']}"
+    )
+
+    # Head detection
     rented_x1, rented_x2 = COLUMNS["rented"]
     owned_x1, owned_x2 = COLUMNS["owned"]
 
     head_rows = []
     head_row_tenure = {}
-
     for row_idx in range(rows_found):
         y1, y2 = row_boundaries[row_idx], row_boundaries[row_idx + 1]
         row_img = gray_ds[y1:y2, :]
-        is_head, tenure, _dbg = detect_head_row_from_tenure_cols(row_img, rented_x1, rented_x2, owned_x1, owned_x2)
+        is_head, tenure = detect_head_row_from_tenure_cols(row_img, rented_x1, rented_x2, owned_x1, owned_x2)
         if is_head:
             head_rows.append(row_idx)
             head_row_tenure[row_idx] = tenure
 
-    # 4) Output
+    # Output
     img_out = os.path.join(OUTPUT_DIR, name)
     ensure_dir(img_out)
 
     if SAVE_VIZ:
         viz_path = os.path.join(img_out, "grid_overlay.png")
-        title = f"{name} | deskew={angle:.2f}deg | rows={rows_found} | head={len(head_rows)} | peak_chain"
+        title = f"{name} | deskew={angle:.2f}deg | rows={rows_found} | head={len(head_rows)}"
         draw_grid_overlay(gray_ds, COLUMNS, row_boundaries, head_rows, head_row_tenure, viz_path, title=title)
         print(f"✅ Grid visualization saved: {viz_path}")
 
     if SAVE_CELLS:
         extract_cells_for_image(gray_ds, COLUMNS, row_boundaries, head_rows, head_row_tenure, img_out)
         print(f"✅ Cells saved under: {img_out}/head_rows and {img_out}/non_head_rows")
+
+    if SAVE_ROW_STRENGTH_DEBUG:
+        dbg_path = os.path.join(img_out, "row_strength_debug.png")
+        save_row_strength_debug(strength, dbg_path, roi_lo, roi_hi, first_line)
+        print(f"✅ Row strength debug saved: {dbg_path}")
 
     report = {
         "image_name": name,
@@ -520,19 +584,8 @@ def process_one_image(img_path: str) -> None:
         "row_detection": debug_rows,
         "rows_found": int(rows_found),
         "row_boundaries": [int(y) for y in row_boundaries],
-        "columns": {k: {"x1": int(v[0]), "x2": int(v[1])} for k, v in COLUMNS.items()},
         "head_rows": [{"row_idx": int(i), "tenure": head_row_tenure.get(i, "NONE")} for i in head_rows],
         "head_rows_count": int(len(head_rows)),
-        "ink_detection": {
-            "pad": int(INK_PAD),
-            "min_ink_ratio": float(MIN_INK_RATIO),
-            "min_cc_area": int(MIN_CC_AREA),
-        },
-        "notes": [
-            "Row boundaries are chosen by chaining real detected horizontal separator peaks (not uniform spacing).",
-            "Head row count is not a quality metric; some pages can have 0 or 1 head rows.",
-            "Column alignment is still fixed for now; we’ll fix per-image x-shift/scale after you verify rows."
-        ],
     }
     save_report_json(os.path.join(img_out, "report.json"), report)
     print(f"✅ Report saved: {os.path.join(img_out, 'report.json')}")
@@ -546,7 +599,7 @@ def main():
         print(f"❌ No images found in: {INPUT_DIR}")
         return
 
-    print("=== SMART ADAPTIVE EXTRACTION v4 (DESKEW + CHAINED 41 ROW LINES) ===")
+    print("=== SMART ADAPTIVE EXTRACTION v6 (STRICT ROI + BOTTOM FENCE) ===")
     print(f"Input:  {INPUT_DIR}")
     print(f"Output: {OUTPUT_DIR}")
     print(f"Images found: {len(imgs)}")
