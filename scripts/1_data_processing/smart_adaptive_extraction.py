@@ -3,27 +3,32 @@ import cv2
 import json
 import numpy as np
 
-
 # ============================================================
 # CONFIG
 # ============================================================
 
 INPUT_DIR = "data/from_jeremy/images_aligned_to_first"
-OUTPUT_DIR = "data/processed/smart_adaptive_extraction_batch_v9_slanted_dualbottom"
+OUTPUT_DIR = "data/processed/smart_adaptive_extraction_batch_v10_enhanced_rules"
 
 NUM_ROWS = 40
 FIRST_ROW_Y_PRIOR = 1263
 EXPECTED_ROW_HEIGHT = 78
 
-# Prior table height (used for ROI + fallback)
+# Approx table height (top row line -> last row line)
 TABLE_HEIGHT_PX = 3160
-BOTTOM_SEARCH_PAD = 500
 
-# ROI for deskew and line detection: focus on table region only
-ROI_TOP_PAD = 240
-ROI_BOTTOM_PAD = 300
+# X span prior (you mentioned ~6150px). This is used to restrict line fitting/drawing
+TABLE_WIDTH_PX = 6150
+TABLE_X_MARGIN = 80  # a bit wider than before to be safe
 
-# Table-bottom detection via dual-signal (vertical + horizontal "table-ness")
+# ROI for deskew and processing around the table
+ROI_TOP_PAD = 260
+ROI_BOTTOM_PAD = 320
+
+# Bottom search
+BOTTOM_SEARCH_PAD = 600
+
+# Dual-signal bottom detection thresholds
 VERT_KERNEL_H_DIV = 18
 VERT_SMOOTH_K = 41
 VERT_MIN_DENSITY_FRAC = 0.18
@@ -31,11 +36,40 @@ VERT_MIN_DENSITY_FRAC = 0.18
 HORIZ_SMOOTH_K = 41
 HORIZ_MIN_DENSITY_FRAC = 0.22  # tune 0.15–0.30 if needed
 
-# Table X span (you said ~6150px)
-TABLE_WIDTH_PX = 6150
-TABLE_X_MARGIN = 50
+# First-line pick ROI around expected FIRST_ROW_Y_PRIOR
+FIRST_LINE_ROI_UP = 340
+FIRST_LINE_ROI_DOWN = 740
 
-# Column coordinates (fixed for now; later we’ll do column alignment)
+# Enhancement knobs (faint rules)
+CLAHE_CLIP = 2.0
+CLAHE_GRID = (8, 8)
+BLACKHAT_KSIZE = 35
+BLACKHAT_MIX = 0.85
+
+# Horizontal mask morphology (depends on width)
+HORIZ_KERNEL_DIV = 16  # kernel width ~ w/div (smaller div => larger kernel)
+HORIZ_OPEN_ITERS = 2
+HORIZ_DILATE_W = 35
+
+# Hough parameters for horizontal rules
+HOUGH_THRESHOLD = 90
+HOUGH_MIN_LINE_LEN = 200
+HOUGH_MAX_GAP = 60
+
+# Merge double-lines for the same printed rule
+RULE_Y_TOL_PX = 12
+
+# Slanted separator detection controls
+MAX_LINE_ANGLE_DEG = 10.0
+CLUSTER_Y_TOL = 14
+MIN_SEGMENTS_PER_CLUSTER = 2
+
+# Head detection knobs (rented/owned ink)
+INK_PAD = 12
+MIN_INK_RATIO = 0.010
+MIN_CC_AREA = 60
+
+# Columns (fixed for now)
 COLUMNS = {
     "street": (629, 718),
     "house_number": (718, 836),
@@ -50,35 +84,13 @@ COLUMNS = {
     "wages": (6433, 6588),
 }
 
+# Save outputs
 SAVE_VIZ = True
 SAVE_CELLS = True
-SAVE_VERTICAL_DENSITY_DEBUG = False
-SAVE_HORIZONTAL_DENSITY_DEBUG = False
-
-# Head/ink detection knobs
-INK_PAD = 12
-MIN_INK_RATIO = 0.010
-MIN_CC_AREA = 60
-
-# First-line search ROI (around expected first table row line)
-FIRST_LINE_ROI_UP = 320
-FIRST_LINE_ROI_DOWN = 720
-
-# Top-line detection (earliest peak, not strongest)
-TOP_PEAK_THR = 0.55
-TOP_CROSS_THR = 0.40
-
-# Slanted line detection (Hough -> cluster -> fit y = m x + b)
-MAX_LINE_ANGLE_DEG = 10.0
-HOUGH_THRESHOLD = 120
-HOUGH_MIN_LINE_LEN = 260
-HOUGH_MAX_GAP = 45
-CLUSTER_Y_TOL = 14
-MIN_SEGMENTS_PER_CLUSTER = 2
-
+SAVE_DEBUG = True  # debug_rule_response, debug_horizontal_mask, densities
 
 # ============================================================
-# FS helpers
+# Helpers
 # ============================================================
 
 def ensure_dir(p: str) -> None:
@@ -97,6 +109,12 @@ def list_images(folder: str):
 def read_gray(path: str):
     return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
 
+def smooth_1d(x: np.ndarray, k: int) -> np.ndarray:
+    k = int(max(3, k))
+    if k % 2 == 0:
+        k += 1
+    return np.convolve(x.astype(np.float32), np.ones(k, dtype=np.float32) / k, mode="same")
+
 def robust_binarize(gray: np.ndarray) -> np.ndarray:
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     return cv2.adaptiveThreshold(
@@ -106,50 +124,126 @@ def robust_binarize(gray: np.ndarray) -> np.ndarray:
         31, 11
     )
 
-def smooth_1d(x: np.ndarray, k: int) -> np.ndarray:
-    k = int(max(3, k))
+# ============================================================
+# Enhancement: CLAHE + Blackhat
+# ============================================================
+
+def enhance_faint_rules(gray: np.ndarray,
+                        clahe_clip=CLAHE_CLIP,
+                        clahe_grid=CLAHE_GRID,
+                        blackhat_ksize=BLACKHAT_KSIZE,
+                        mix=BLACKHAT_MIX):
+    """
+    Boost faint dark rules on light background.
+    Returns:
+      enhanced_gray: boosted grayscale
+      rule_response: rule-likelihood response (bright where rules exist)
+    """
+    clahe = cv2.createCLAHE(clipLimit=float(clahe_clip), tileGridSize=tuple(clahe_grid))
+    g = clahe.apply(gray)
+
+    k = int(blackhat_ksize)
     if k % 2 == 0:
         k += 1
-    return np.convolve(x.astype(np.float32), np.ones(k, dtype=np.float32) / k, mode="same")
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    blackhat = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, kernel)
 
+    rule_response = cv2.normalize(blackhat, None, 0, 255, cv2.NORM_MINMAX)
+    enhanced_gray = cv2.addWeighted(g, 1.0, rule_response, float(mix), 0)
+    return enhanced_gray, rule_response
+
+def horizontal_line_mask_from_enhanced(enhanced_gray: np.ndarray) -> np.ndarray:
+    blur = cv2.GaussianBlur(enhanced_gray, (3, 3), 0)
+    bin_img = cv2.adaptiveThreshold(
+        blur, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31, 9
+    )
+    inv = 255 - bin_img
+    h, w = inv.shape
+
+    hk = max(60, w // HORIZ_KERNEL_DIV)
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hk, 1))
+    horiz = cv2.morphologyEx(inv, cv2.MORPH_OPEN, horiz_kernel, iterations=HORIZ_OPEN_ITERS)
+    horiz = cv2.dilate(horiz, cv2.getStructuringElement(cv2.MORPH_RECT, (HORIZ_DILATE_W, 1)), iterations=1)
+    return horiz
+
+def detect_horizontal_segments_hough(horiz_mask: np.ndarray):
+    edges = cv2.Canny(horiz_mask, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=int(HOUGH_THRESHOLD),
+        minLineLength=int(HOUGH_MIN_LINE_LEN),
+        maxLineGap=int(HOUGH_MAX_GAP)
+    )
+    if lines is None:
+        return []
+    return [tuple(map(int, l[0])) for l in lines]
+
+def cluster_segments_into_rule_ys(segments, y_tol=RULE_Y_TOL_PX):
+    """
+    Merge double-lines (edges of the same printed rule).
+    Returns sorted list of representative y-values (one per rule).
+    """
+    if not segments:
+        return []
+    items = []
+    for x1, y1, x2, y2 in segments:
+        ymid = 0.5 * (y1 + y2)
+        length = abs(x2 - x1) + abs(y2 - y1)
+        items.append((ymid, length))
+    items.sort(key=lambda t: t[0])
+
+    clusters = []
+    cur = [items[0]]
+    for it in items[1:]:
+        if abs(it[0] - cur[-1][0]) <= y_tol:
+            cur.append(it)
+        else:
+            clusters.append(cur)
+            cur = [it]
+    clusters.append(cur)
+
+    rule_ys = []
+    for cl in clusters:
+        # take weighted avg by length
+        ys = np.array([c[0] for c in cl], dtype=np.float32)
+        ws = np.array([c[1] for c in cl], dtype=np.float32)
+        y = float(np.sum(ys * ws) / max(1.0, float(np.sum(ws))))
+        rule_ys.append(int(round(y)))
+
+    rule_ys = sorted(list(set(rule_ys)))
+    return rule_ys
 
 # ============================================================
-# ROI deskew (minAreaRect on table lines)
+# ROI Deskew via minAreaRect on line pixels
 # ============================================================
 
-def extract_table_roi(gray: np.ndarray, first_row_y_prior: int) -> (np.ndarray, int, int):
+def extract_table_roi(gray: np.ndarray, first_row_y_prior: int):
     h = gray.shape[0]
     y0 = max(0, first_row_y_prior - ROI_TOP_PAD)
     y1 = min(h, first_row_y_prior + TABLE_HEIGHT_PX + ROI_BOTTOM_PAD)
     return gray[y0:y1, :], y0, y1
 
 def estimate_skew_angle_minarearect(gray_roi: np.ndarray) -> float:
-    bin_img = robust_binarize(gray_roi)
-    inv = 255 - bin_img
+    # Enhance faint rules inside ROI for better angle estimation
+    enh, _ = enhance_faint_rules(gray_roi)
+    hmask = horizontal_line_mask_from_enhanced(enh)
 
-    h, w = inv.shape
-    hk = max(45, w // 22)
-    vk = max(45, h // VERT_KERNEL_H_DIV)
-
-    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hk, 1))
-    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vk))
-
-    horiz = cv2.morphologyEx(inv, cv2.MORPH_OPEN, horiz_kernel, iterations=2)
-    vert = cv2.morphologyEx(inv, cv2.MORPH_OPEN, vert_kernel, iterations=1)
-
-    mask = cv2.bitwise_or(horiz, vert)
-    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
-
-    ys, xs = np.where(mask > 0)
-    if len(xs) < 5000:
+    edges = cv2.Canny(hmask, 50, 150, apertureSize=3)
+    ys, xs = np.where(edges > 0)
+    if len(xs) < 2500:
         return 0.0
 
     pts = np.column_stack([xs, ys]).astype(np.float32)
     rect = cv2.minAreaRect(pts)
     angle = float(rect[-1])
-    (rw, rh) = rect[1]
+    rw, rh = rect[1]
     if rw < rh:
-        angle = angle + 90.0
+        angle += 90.0
 
     if angle > 20 or angle < -20:
         return 0.0
@@ -169,80 +263,37 @@ def deskew_using_roi(gray: np.ndarray, first_row_y_prior: int):
     dbg = {"method": "roi_minAreaRect", "roi_y0": int(y0), "roi_y1": int(y1), "angle_deg": float(angle)}
     return gray_ds, float(angle), dbg
 
+# ============================================================
+# Table top: earliest rule near expected
+# ============================================================
+
+def pick_table_top_from_rule_ys(rule_ys, first_y_prior: int):
+    if not rule_ys:
+        return int(first_y_prior), {"picked_from": "prior_fallback_no_rules"}
+
+    roi_lo = first_y_prior - FIRST_LINE_ROI_UP
+    roi_hi = first_y_prior + FIRST_LINE_ROI_DOWN
+    candidates = [y for y in rule_ys if roi_lo <= y <= roi_hi]
+    if candidates:
+        return int(min(candidates)), {"picked_from": "roi_earliest_rule", "roi_lo": int(roi_lo), "roi_hi": int(roi_hi)}
+    # fallback: nearest rule to prior
+    nearest = min(rule_ys, key=lambda y: abs(y - first_y_prior))
+    return int(nearest), {"picked_from": "nearest_rule_fallback"}
 
 # ============================================================
-# Line masks (horizontal + vertical)
+# Table bottom: dual-signal density (vertical + horizontal "table-ness")
 # ============================================================
-
-def horizontal_lines_mask(gray: np.ndarray) -> np.ndarray:
-    bin_img = robust_binarize(gray)
-    inv = 255 - bin_img
-    h, w = inv.shape
-
-    hk = max(55, w // 18)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hk, 1))
-    horiz = cv2.morphologyEx(inv, cv2.MORPH_OPEN, kernel, iterations=2)
-    horiz = cv2.dilate(horiz, cv2.getStructuringElement(cv2.MORPH_RECT, (35, 1)), iterations=1)
-    return horiz
 
 def vertical_lines_mask(gray: np.ndarray) -> np.ndarray:
+    # use standard binarize (good enough), table bottom detection doesn’t need ultra faint detail
     bin_img = robust_binarize(gray)
     inv = 255 - bin_img
-
     h, w = inv.shape
     vk = max(55, h // VERT_KERNEL_H_DIV)
     vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vk))
-
     vert = cv2.morphologyEx(inv, cv2.MORPH_OPEN, vert_kernel, iterations=1)
     vert = cv2.dilate(vert, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 9)), iterations=1)
     return vert
-
-def horizontal_line_strength(gray: np.ndarray) -> np.ndarray:
-    mask = horizontal_lines_mask(gray)
-    strength = np.sum(mask > 0, axis=1).astype(np.float32)
-    return smooth_1d(strength, 9)
-
-
-# ============================================================
-# TOP line detection (earliest strong peak in ROI)
-# ============================================================
-
-def pick_first_line_earliest_peak(gray: np.ndarray, first_y_prior: int) -> (int, dict):
-    strength = horizontal_line_strength(gray)
-    h = len(strength)
-
-    roi_lo = max(0, first_y_prior - FIRST_LINE_ROI_UP)
-    roi_hi = min(h - 1, first_y_prior + FIRST_LINE_ROI_DOWN)
-
-    roi = strength[roi_lo:roi_hi + 1]
-    if roi.size == 0 or float(roi.max()) <= 0:
-        return int(first_y_prior), {"roi_lo": roi_lo, "roi_hi": roi_hi, "picked_from": "prior_fallback"}
-
-    r = roi.astype(np.float32)
-    r = r / float(r.max())
-
-    # earliest local maxima above TOP_PEAK_THR
-    candidates = []
-    for i in range(1, len(r) - 1):
-        if r[i] > r[i-1] and r[i] > r[i+1] and r[i] >= TOP_PEAK_THR:
-            candidates.append(i)
-
-    if candidates:
-        first = int(roi_lo + candidates[0])
-        return first, {"roi_lo": int(roi_lo), "roi_hi": int(roi_hi), "picked_from": "roi_first_peak", "thr": float(TOP_PEAK_THR)}
-
-    # fallback: earliest crossing
-    idx = np.where(r >= TOP_CROSS_THR)[0]
-    if idx.size > 0:
-        first = int(roi_lo + int(idx[0]))
-        return first, {"roi_lo": int(roi_lo), "roi_hi": int(roi_hi), "picked_from": "roi_first_crossing", "thr": float(TOP_CROSS_THR)}
-
-    return int(first_y_prior), {"roi_lo": int(roi_lo), "roi_hi": int(roi_hi), "picked_from": "prior_fallback"}
-
-
-# ============================================================
-# BOTTOM detection (dual-signal: vertical + horizontal density)
-# ============================================================
 
 def detect_table_bottom_dual_signal(gray: np.ndarray, table_top_y: int):
     h, w = gray.shape
@@ -251,12 +302,14 @@ def detect_table_bottom_dual_signal(gray: np.ndarray, table_top_y: int):
     vdens = np.sum(vmask > 0, axis=1).astype(np.float32)
     vdens_s = smooth_1d(vdens, VERT_SMOOTH_K)
 
-    hmask = horizontal_lines_mask(gray)
+    # For horizontal density, use enhanced mask (more stable for table region)
+    enh, _ = enhance_faint_rules(gray)
+    hmask = horizontal_line_mask_from_enhanced(enh)
     hdens = np.sum(hmask > 0, axis=1).astype(np.float32)
     hdens_s = smooth_1d(hdens, HORIZ_SMOOTH_K)
 
     expected_bottom = int(table_top_y + TABLE_HEIGHT_PX)
-    search_start = int(max(0, expected_bottom - 300))
+    search_start = int(max(0, expected_bottom - 350))
     search_end = int(min(h - 1, expected_bottom + BOTTOM_SEARCH_PAD))
 
     mid0 = int(max(0, table_top_y + 400))
@@ -268,7 +321,7 @@ def detect_table_bottom_dual_signal(gray: np.ndarray, table_top_y: int):
     v_thr = v_typ * float(VERT_MIN_DENSITY_FRAC)
     h_thr = h_typ * float(HORIZ_MIN_DENSITY_FRAC)
 
-    window = 90
+    window = 95
     bottom_y = expected_bottom
 
     for y in range(search_start, max(search_start, search_end - window)):
@@ -306,9 +359,8 @@ def save_density_debug(arr: np.ndarray, out_path: str, mark_top: int, mark_botto
     ensure_dir(os.path.dirname(out_path))
     cv2.imwrite(out_path, img)
 
-
 # ============================================================
-# Slanted separator detection (Hough -> cluster -> fit y = m x + b)
+# Slanted separators: fit y = m x + b per rule using Hough segments
 # ============================================================
 
 def fit_line_y_mx_b(points_xy: np.ndarray):
@@ -320,88 +372,54 @@ def fit_line_y_mx_b(points_xy: np.ndarray):
     m, b = np.linalg.lstsq(A, ys, rcond=None)[0]
     return float(m), float(b)
 
-def detect_slanted_separators(gray: np.ndarray, table_top: int, table_bottom: int, xL: int, xR: int):
-    h, w = gray.shape
-    xL = int(max(0, min(w - 1, xL)))
-    xR = int(max(0, min(w - 1, xR)))
-    if xR <= xL + 10:
-        return [], {"status": "bad_x_bounds"}
+def segments_to_slanted_lines(segments, xL, xR):
+    """
+    Convert many horizontal-ish segments into a list of fitted slanted lines (m,b),
+    clustered by y-at-mid, with near-duplicate merging handled by clustering.
+    """
+    if not segments:
+        return [], {"status": "no_segments"}
 
-    y0 = int(max(0, table_top - 60))
-    y1 = int(min(h - 1, table_bottom + 15))
-
-    roi = gray[y0:y1, xL:xR]
-    if roi.size == 0:
-        return [], {"status": "empty_roi"}
-
-    mask = horizontal_lines_mask(roi)
-    edges = cv2.Canny(mask, 50, 150, apertureSize=3)
-
-    lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=HOUGH_THRESHOLD,
-        minLineLength=HOUGH_MIN_LINE_LEN,
-        maxLineGap=HOUGH_MAX_GAP
-    )
-
-    if lines is None:
-        return [], {"status": "no_hough_lines", "y0": y0, "y1": y1, "xL": xL, "xR": xR}
-
-    segs = []
+    xmid = 0.5 * (xL + xR)
     max_tan = np.tan(np.deg2rad(MAX_LINE_ANGLE_DEG))
-    for (x1, yy1, x2, yy2) in lines[:, 0]:
+
+    items = []
+    for x1, y1, x2, y2 in segments:
         dx = (x2 - x1)
-        dy = (yy2 - yy1)
+        dy = (y2 - y1)
         if dx == 0:
             continue
         slope = dy / dx
         if abs(slope) > max_tan:
             continue
-        ax1, ay1 = int(x1 + xL), int(yy1 + y0)
-        ax2, ay2 = int(x2 + xL), int(yy2 + y0)
-        segs.append((ax1, ay1, ax2, ay2))
-
-    if not segs:
-        return [], {"status": "no_near_horizontal_segments"}
-
-    xmid = 0.5 * (xL + xR)
-    items = []
-    for (x1, y1, x2, y2) in segs:
-        if x2 == x1:
-            continue
-        m = (y2 - y1) / (x2 - x1)
+        m = slope
         b = y1 - m * x1
         y_at_mid = m * xmid + b
-        items.append((float(y_at_mid), (x1, y1, x2, y2)))
+        length = abs(dx) + abs(dy)
+        items.append((float(y_at_mid), float(length), (x1, y1, x2, y2)))
+
+    if not items:
+        return [], {"status": "no_near_horizontal_segments"}
 
     items.sort(key=lambda t: t[0])
 
+    # cluster by y_at_mid
     clusters = []
-    cur = []
-    cur_y = None
-
-    for ymid, seg in items:
-        if cur_y is None:
-            cur = [seg]
-            cur_y = ymid
-        elif abs(ymid - cur_y) <= CLUSTER_Y_TOL:
-            cur.append(seg)
-            cur_y = (cur_y * 0.7 + ymid * 0.3)
+    cur = [items[0]]
+    for it in items[1:]:
+        if abs(it[0] - cur[-1][0]) <= CLUSTER_Y_TOL:
+            cur.append(it)
         else:
             clusters.append(cur)
-            cur = [seg]
-            cur_y = ymid
-    if cur:
-        clusters.append(cur)
+            cur = [it]
+    clusters.append(cur)
 
     fitted = []
     for cl in clusters:
         if len(cl) < MIN_SEGMENTS_PER_CLUSTER:
             continue
         pts = []
-        for (x1, y1, x2, y2) in cl:
+        for _, _, (x1, y1, x2, y2) in cl:
             pts.append((x1, y1))
             pts.append((x2, y2))
         pts = np.array(pts, dtype=np.float32)
@@ -410,62 +428,105 @@ def detect_slanted_separators(gray: np.ndarray, table_top: int, table_bottom: in
         fitted.append((float(yrep), float(m), float(b), int(len(cl))))
 
     fitted.sort(key=lambda t: t[0])
+    lines_mb = [(m, b) for (_, m, b, _) in fitted]
+    dbg = {"status": "ok", "segments_in": int(len(segments)), "clusters_total": int(len(clusters)), "clusters_used": int(len(lines_mb))}
+    return lines_mb, dbg
 
-    debug = {
-        "status": "ok",
-        "segments_total": int(len(segs)),
-        "clusters_total": int(len(clusters)),
-        "clusters_used": int(len(fitted)),
-        "y0": int(y0),
-        "y1": int(y1),
-        "xL": int(xL),
-        "xR": int(xR),
-    }
-    return [(m, b) for (_, m, b, _) in fitted], debug
+def merge_close_slanted_lines(lines_mb, xmid, merge_px=10):
+    """
+    Merge near-duplicate fitted lines (double-edge of same printed rule).
+    """
+    if not lines_mb:
+        return []
+
+    items = []
+    for (m, b) in lines_mb:
+        y = m * xmid + b
+        items.append((float(y), float(m), float(b)))
+    items.sort(key=lambda t: t[0])
+
+    merged = []
+    group = [items[0]]
+
+    for it in items[1:]:
+        if abs(it[0] - group[-1][0]) <= merge_px:
+            group.append(it)
+        else:
+            ms = [g[1] for g in group]
+            bs = [g[2] for g in group]
+            merged.append((float(np.mean(ms)), float(np.mean(bs))))
+            group = [it]
+
+    ms = [g[1] for g in group]
+    bs = [g[2] for g in group]
+    merged.append((float(np.mean(ms)), float(np.mean(bs))))
+    return merged
 
 def select_41_separators(lines_mb, table_top, table_bottom, xL, xR):
     if not lines_mb:
         return []
-
     xmid = 0.5 * (xL + xR)
+
     ys = []
     for (m, b) in lines_mb:
         y = m * xmid + b
-        if table_top - 60 <= y <= table_bottom + 25:
+        if (table_top - 80) <= y <= (table_bottom + 30):
             ys.append((float(y), float(m), float(b)))
     ys.sort(key=lambda t: t[0])
 
-    if len(ys) <= NUM_ROWS + 1:
+    if len(ys) < NUM_ROWS + 1:
         return [(m, b) for (_, m, b) in ys]
 
-    target = NUM_ROWS + 1
-    idxs = np.linspace(0, len(ys) - 1, target).round().astype(int)
-    chosen = [ys[i] for i in idxs]
-    chosen.sort(key=lambda t: t[0])
-    return [(m, b) for (_, m, b) in chosen]
+    if len(ys) > NUM_ROWS + 1:
+        idxs = np.linspace(0, len(ys) - 1, NUM_ROWS + 1).round().astype(int)
+        chosen = [ys[i] for i in idxs]
+        chosen.sort(key=lambda t: t[0])
+        return [(m, b) for (_, m, b) in chosen]
 
+    return [(m, b) for (_, m, b) in ys]
 
 # ============================================================
-# Warp each row band to rectangle + cut cells
+# Fallback flat boundaries (clamped to bottom)
 # ============================================================
 
-def y_on_line(m: float, b: float, x: float) -> float:
-    return m * x + b
+def fallback_flat_boundaries(table_top: int, table_bottom: int):
+    boundaries = [int(table_top)]
+    cur = int(table_top)
+    for _ in range(NUM_ROWS):
+        nxt = cur + EXPECTED_ROW_HEIGHT
+        if nxt >= table_bottom:
+            nxt = table_bottom
+        boundaries.append(int(nxt))
+        cur = int(nxt)
+        if cur >= table_bottom:
+            break
+
+    while len(boundaries) < NUM_ROWS + 1:
+        boundaries.append(boundaries[-1] + 1)
+
+    return boundaries[:NUM_ROWS + 1]
+
+# ============================================================
+# Row band warp (slanted)
+# ============================================================
 
 def warp_row_band(gray: np.ndarray, line_top, line_bot, xL: int, xR: int):
     h, w = gray.shape
     xL = int(np.clip(xL, 0, w - 1))
     xR = int(np.clip(xR, 0, w - 1))
     if xR <= xL + 10:
-        return None, None
+        return None
 
     m1, b1 = line_top
     m2, b2 = line_bot
 
-    y1L = float(np.clip(y_on_line(m1, b1, xL), 0, h - 1))
-    y1R = float(np.clip(y_on_line(m1, b1, xR), 0, h - 1))
-    y2R = float(np.clip(y_on_line(m2, b2, xR), 0, h - 1))
-    y2L = float(np.clip(y_on_line(m2, b2, xL), 0, h - 1))
+    def y_on(m, b, x):
+        return float(np.clip(m * x + b, 0, h - 1))
+
+    y1L = y_on(m1, b1, xL)
+    y1R = y_on(m1, b1, xR)
+    y2R = y_on(m2, b2, xR)
+    y2L = y_on(m2, b2, xL)
 
     src = np.array([[xL, y1L], [xR, y1R], [xR, y2R], [xL, y2L]], dtype=np.float32)
 
@@ -477,13 +538,10 @@ def warp_row_band(gray: np.ndarray, line_top, line_bot, xL: int, xR: int):
 
     M = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(gray, M, (out_w, out_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
-    meta = {"src_quad": src.tolist(), "out_w": out_w, "out_h": out_h}
-    return warped, meta
-
+    return warped
 
 # ============================================================
-# Head detection (rented/owned ink) on warped row
+# Head detection (rented/owned ink)
 # ============================================================
 
 def remove_table_lines(ink_mask: np.ndarray) -> np.ndarray:
@@ -529,9 +587,9 @@ def cell_has_ink(cell_gray: np.ndarray) -> bool:
     largest_area = int(stats[1:, cv2.CC_STAT_AREA].max())
     return largest_area >= MIN_CC_AREA
 
-def detect_head_row_from_tenure_cols_warped(row_warp: np.ndarray, rented_x1: int, rented_x2: int, owned_x1: int, owned_x2: int):
-    rented_cell = row_warp[:, rented_x1:rented_x2]
-    owned_cell = row_warp[:, owned_x1:owned_x2]
+def detect_head_row_from_tenure_cols(row_img_gray: np.ndarray, rented_x1: int, rented_x2: int, owned_x1: int, owned_x2: int):
+    rented_cell = row_img_gray[:, rented_x1:rented_x2]
+    owned_cell = row_img_gray[:, owned_x1:owned_x2]
 
     is_rented = cell_has_ink(rented_cell)
     is_owned = cell_has_ink(owned_cell)
@@ -547,13 +605,21 @@ def detect_head_row_from_tenure_cols_warped(row_warp: np.ndarray, rented_x1: int
         tenure = "NONE"
     return is_head, tenure
 
-
 # ============================================================
-# Visualization + extraction
+# Visualization
 # ============================================================
 
-def draw_overlay_slanted(gray: np.ndarray, columns: dict, lines_mb: list, head_rows: list, head_row_tenure: dict,
-                         xL: int, xR: int, table_bottom_y: int, out_path: str, title: str = ""):
+def draw_overlay(gray: np.ndarray, columns: dict,
+                 mode: str, xL: int, xR: int,
+                 table_top: int, table_bottom: int,
+                 slanted_lines=None, flat_boundaries=None,
+                 head_rows=None, head_row_tenure=None,
+                 out_path: str = "", title: str = ""):
+    slanted_lines = slanted_lines or []
+    flat_boundaries = flat_boundaries or []
+    head_rows = head_rows or []
+    head_row_tenure = head_row_tenure or {}
+
     viz = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     h, w = gray.shape
 
@@ -565,56 +631,67 @@ def draw_overlay_slanted(gray: np.ndarray, columns: dict, lines_mb: list, head_r
         cv2.line(viz, (b, 0), (b, h), (255, 0, 0), 2)
         cv2.putText(viz, col_name, (a, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2)
 
-    yb = int(np.clip(table_bottom_y, 0, h - 1))
+    yt = int(np.clip(table_top, 0, h - 1))
+    yb = int(np.clip(table_bottom, 0, h - 1))
+    cv2.line(viz, (0, yt), (w, yt), (255, 255, 0), 2)
+    cv2.putText(viz, "TABLE_TOP", (40, max(0, yt - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
     cv2.line(viz, (0, yb), (w, yb), (0, 255, 255), 3)
-    cv2.putText(viz, "TABLE_BOTTOM", (40, yb - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(viz, "TABLE_BOTTOM", (40, max(0, yb - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
     xL = int(np.clip(xL, 0, w - 1))
     xR = int(np.clip(xR, 0, w - 1))
 
-    for i, (m, b) in enumerate(lines_mb):
-        yL = int(np.clip(m * xL + b, 0, h - 1))
-        yR = int(np.clip(m * xR + b, 0, h - 1))
-
-        is_head = (i in head_rows)
-        color = (0, 255, 0) if is_head else (0, 0, 255)
-        thick = 3 if is_head else 2
-
-        cv2.line(viz, (xL, yL), (xR, yR), color, thick)
-
-        if i < len(lines_mb) - 1:
+    if mode == "slanted":
+        for i, (m, b) in enumerate(slanted_lines):
+            yL = int(np.clip(m * xL + b, 0, h - 1))
+            yR = int(np.clip(m * xR + b, 0, h - 1))
+            is_head = i in head_rows
+            color = (0, 255, 0) if is_head else (0, 0, 255)
+            thick = 3 if is_head else 2
+            cv2.line(viz, (xL, yL), (xR, yR), color, thick)
             if is_head:
                 tenure = head_row_tenure.get(i, "HEAD")
-                cv2.putText(viz, f"HEAD {i} [{tenure}]", (xL + 10, yL + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 0), 2)
-            else:
-                cv2.putText(viz, f"{i}", (xL + 10, yL + 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1)
+                cv2.putText(viz, f"HEAD {i} [{tenure}]", (40, min(h - 10, max(10, yL + 18))),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    else:
+        for i, y in enumerate(flat_boundaries):
+            yy = int(np.clip(y, 0, h - 1))
+            is_head = i in head_rows
+            color = (0, 255, 0) if is_head else (0, 0, 255)
+            thick = 3 if is_head else 2
+            cv2.line(viz, (0, yy), (w, yy), color, thick)
+            if is_head:
+                tenure = head_row_tenure.get(i, "HEAD")
+                cv2.putText(viz, f"HEAD {i} [{tenure}]", (40, min(h - 10, max(10, yy + 18))),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     ensure_dir(os.path.dirname(out_path))
     cv2.imwrite(out_path, viz)
 
-def extract_cells_warped_rows(gray: np.ndarray, lines_mb: list, columns: dict, xL: int, xR: int, out_dir: str):
+# ============================================================
+# Extraction
+# ============================================================
+
+def extract_cells_slanted(gray: np.ndarray, slanted_lines: list, columns: dict, xL: int, xR: int, out_dir: str):
     head_dir = os.path.join(out_dir, "head_rows")
     non_dir = os.path.join(out_dir, "non_head_rows")
-    ensure_dir(head_dir)
-    ensure_dir(non_dir)
+    ensure_dir(head_dir); ensure_dir(non_dir)
 
+    # columns relative to warp ROI
     col_warp = {k: (max(0, a - xL), max(0, b - xL)) for k, (a, b) in columns.items()}
-
     rented_x1, rented_x2 = col_warp["rented"]
     owned_x1, owned_x2 = col_warp["owned"]
 
     head_rows = []
     head_row_tenure = {}
 
-    rows_found = min(NUM_ROWS, len(lines_mb) - 1)
+    rows_found = min(NUM_ROWS, len(slanted_lines) - 1)
     for row_idx in range(rows_found):
-        row_warp, meta = warp_row_band(gray, lines_mb[row_idx], lines_mb[row_idx + 1], xL, xR)
+        row_warp = warp_row_band(gray, slanted_lines[row_idx], slanted_lines[row_idx + 1], xL, xR)
         if row_warp is None or row_warp.size == 0:
             continue
 
-        is_head, tenure = detect_head_row_from_tenure_cols_warped(row_warp, rented_x1, rented_x2, owned_x1, owned_x2)
+        is_head, tenure = detect_head_row_from_tenure_cols(row_warp, rented_x1, rented_x2, owned_x1, owned_x2)
         if is_head:
             head_rows.append(row_idx)
             head_row_tenure[row_idx] = tenure
@@ -630,16 +707,54 @@ def extract_cells_warped_rows(gray: np.ndarray, lines_mb: list, columns: dict, x
             cell = row_warp[:, a:b]
             if cell.size == 0:
                 continue
-            fname = f"{prefix}row{row_idx:02d}_{col_name}.png"
-            cv2.imwrite(os.path.join(out, fname), cell)
+            cv2.imwrite(os.path.join(out, f"{prefix}row{row_idx:02d}_{col_name}.png"), cell)
 
     return head_rows, head_row_tenure, rows_found
+
+def extract_cells_flat(gray: np.ndarray, boundaries: list, columns: dict, out_dir: str):
+    head_dir = os.path.join(out_dir, "head_rows")
+    non_dir = os.path.join(out_dir, "non_head_rows")
+    ensure_dir(head_dir); ensure_dir(non_dir)
+
+    rented_x1, rented_x2 = columns["rented"]
+    owned_x1, owned_x2 = columns["owned"]
+
+    head_rows = []
+    head_row_tenure = {}
+
+    rows_found = min(NUM_ROWS, len(boundaries) - 1)
+    for row_idx in range(rows_found):
+        y1, y2 = int(boundaries[row_idx]), int(boundaries[row_idx + 1])
+        y1 = max(0, min(gray.shape[0]-1, y1))
+        y2 = max(0, min(gray.shape[0], y2))
+        if y2 <= y1:
+            continue
+
+        row_img = gray[y1:y2, :]
+        is_head, tenure = detect_head_row_from_tenure_cols(row_img, rented_x1, rented_x2, owned_x1, owned_x2)
+        if is_head:
+            head_rows.append(row_idx)
+            head_row_tenure[row_idx] = tenure
+
+        out = head_dir if is_head else non_dir
+        prefix = f"HEAD_{tenure}_" if is_head else ""
+
+        for col_name, (x1, x2) in columns.items():
+            cell = gray[y1:y2, x1:x2]
+            if cell.size == 0:
+                continue
+            cv2.imwrite(os.path.join(out, f"{prefix}row{row_idx:02d}_{col_name}.png"), cell)
+
+    return head_rows, head_row_tenure, rows_found
+
+# ============================================================
+# Report
+# ============================================================
 
 def save_report_json(out_path: str, payload: dict) -> None:
     ensure_dir(os.path.dirname(out_path))
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
-
 
 # ============================================================
 # Main per-image
@@ -654,70 +769,74 @@ def process_one_image(img_path: str) -> None:
         print("⚠️ Could not read image. Skipping.")
         return
 
-    # 1) ROI deskew
+    img_out = os.path.join(OUTPUT_DIR, name)
+    ensure_dir(img_out)
+
+    # 1) Deskew with ROI
     gray_ds, angle, deskew_dbg = deskew_using_roi(gray, FIRST_ROW_Y_PRIOR)
 
-    # 2) TOP line (earliest peak)
-    table_top, top_dbg = pick_first_line_earliest_peak(gray_ds, FIRST_ROW_Y_PRIOR)
+    # 2) Enhance + build horizontal mask + detect segments (for rule ys + slanted fit)
+    enh, rule_resp = enhance_faint_rules(gray_ds)
+    hmask = horizontal_line_mask_from_enhanced(enh)
+    segs = detect_horizontal_segments_hough(hmask)
+    rule_ys = cluster_segments_into_rule_ys(segs)
 
-    # 3) BOTTOM line (dual-signal)
+    # 3) Table top from earliest rule near expected
+    table_top, top_dbg = pick_table_top_from_rule_ys(rule_ys, FIRST_ROW_Y_PRIOR)
+
+    # 4) Table bottom dual signal
     table_bottom, bottom_dbg, vdens_s, hdens_s = detect_table_bottom_dual_signal(gray_ds, table_top)
 
-    # 4) table x-bounds using your width prior (~6150px), anchored at min column x1
+    # 5) Define table x bounds
     min_x1 = min(v[0] for v in COLUMNS.values())
     xL = int(min_x1 - TABLE_X_MARGIN)
     xR = int(xL + TABLE_WIDTH_PX + 2 * TABLE_X_MARGIN)
 
-    # 5) slanted separators
-    lines_mb_all, slant_dbg = detect_slanted_separators(gray_ds, table_top, table_bottom, xL, xR)
+    h, w = gray_ds.shape
+    xL = max(0, min(w - 2, xL))
+    xR = max(xL + 1, min(w - 1, xR))
+
+    # 6) Build slanted separators from segments + merge close
+    xmid = 0.5 * (xL + xR)
+    lines_mb_all, slant_dbg = segments_to_slanted_lines(segs, xL, xR)
+    lines_mb_all = merge_close_slanted_lines(lines_mb_all, xmid=xmid, merge_px=10)
     lines_mb = select_41_separators(lines_mb_all, table_top, table_bottom, xL, xR)
 
-    print(f"deskew={angle:.3f}deg | top={table_top} | bottom={table_bottom} | slanted={len(lines_mb)} (raw={len(lines_mb_all)})")
+    slanted_mode = (len(lines_mb) >= NUM_ROWS + 1)
 
-    img_out = os.path.join(OUTPUT_DIR, name)
-    ensure_dir(img_out)
+    # 7) Extract (always)
+    mode_used = "slanted" if slanted_mode else "flat_fallback"
+    head_rows, head_row_tenure, rows_found = [], {}, 0
 
-    # If slanted detection fails, write report and skip
-    if len(lines_mb) < NUM_ROWS + 1:
-        print("⚠️ Not enough slanted separators detected for 40 rows. Skipping this image.")
-        save_report_json(os.path.join(img_out, "report.json"), {
-            "image_name": name,
-            "source_path": img_path,
-            "deskew": deskew_dbg,
-            "table_top": int(table_top),
-            "table_top_debug": top_dbg,
-            "table_bottom": int(table_bottom),
-            "bottom_detection": bottom_dbg,
-            "slanted_debug": slant_dbg,
-            "status": "failed_slanted_separator_detection",
-            "slanted_count": int(len(lines_mb)),
-            "slanted_raw_count": int(len(lines_mb_all)),
-        })
-        return
-
-    # 6) Warp rows + extract cells
-    head_rows, head_row_tenure, rows_found = ([], {}, 0)
     if SAVE_CELLS:
-        head_rows, head_row_tenure, rows_found = extract_cells_warped_rows(gray_ds, lines_mb, COLUMNS, xL, xR, img_out)
-        print(f"✅ Cells saved: {img_out}/head_rows and {img_out}/non_head_rows | rows={rows_found} | head={len(head_rows)}")
+        if slanted_mode:
+            head_rows, head_row_tenure, rows_found = extract_cells_slanted(gray_ds, lines_mb, COLUMNS, xL, xR, img_out)
+        else:
+            boundaries = fallback_flat_boundaries(table_top, table_bottom)
+            head_rows, head_row_tenure, rows_found = extract_cells_flat(gray_ds, boundaries, COLUMNS, img_out)
 
-    # 7) Overlay
+    # 8) Overlay (always)
     if SAVE_VIZ:
         viz_path = os.path.join(img_out, "grid_overlay.png")
-        title = f"{name} | deskew={angle:.2f}deg | rows={rows_found} | head={len(head_rows)}"
-        draw_overlay_slanted(gray_ds, COLUMNS, lines_mb, head_rows, head_row_tenure, xL, xR, table_bottom, viz_path, title=title)
-        print(f"✅ Grid visualization saved: {viz_path}")
+        title = f"{name} | mode={mode_used} | deskew={angle:.2f} | rules={len(rule_ys)} | rows={rows_found} | head={len(head_rows)}"
+        if slanted_mode:
+            draw_overlay(gray_ds, COLUMNS, "slanted", xL, xR, table_top, table_bottom,
+                         slanted_lines=lines_mb, head_rows=head_rows, head_row_tenure=head_row_tenure,
+                         out_path=viz_path, title=title)
+        else:
+            boundaries = fallback_flat_boundaries(table_top, table_bottom)
+            draw_overlay(gray_ds, COLUMNS, "flat", xL, xR, table_top, table_bottom,
+                         flat_boundaries=boundaries, head_rows=head_rows, head_row_tenure=head_row_tenure,
+                         out_path=viz_path, title=title)
 
-    if SAVE_VERTICAL_DENSITY_DEBUG:
-        vdbg_path = os.path.join(img_out, "vertical_density_debug.png")
-        save_density_debug(vdens_s, vdbg_path, mark_top=table_top, mark_bottom=table_bottom)
-        print(f"✅ Vertical density debug saved: {vdbg_path}")
+    # 9) Debug images
+    if SAVE_DEBUG:
+        cv2.imwrite(os.path.join(img_out, "debug_rule_response.png"), rule_resp)
+        cv2.imwrite(os.path.join(img_out, "debug_horizontal_mask.png"), hmask)
+        save_density_debug(vdens_s, os.path.join(img_out, "debug_vertical_density.png"), mark_top=table_top, mark_bottom=table_bottom)
+        save_density_debug(hdens_s, os.path.join(img_out, "debug_horizontal_density.png"), mark_top=table_top, mark_bottom=table_bottom)
 
-    if SAVE_HORIZONTAL_DENSITY_DEBUG:
-        hdbg_path = os.path.join(img_out, "horizontal_density_debug.png")
-        save_density_debug(hdens_s, hdbg_path, mark_top=table_top, mark_bottom=table_bottom)
-        print(f"✅ Horizontal density debug saved: {hdbg_path}")
-
+    # 10) Report always
     report = {
         "image_name": name,
         "source_path": img_path,
@@ -728,15 +847,35 @@ def process_one_image(img_path: str) -> None:
         "bottom_detection": bottom_dbg,
         "table_xL": int(xL),
         "table_xR": int(xR),
+        "mode_used": mode_used,
+        "enhancement": {
+            "clahe_clip": float(CLAHE_CLIP),
+            "clahe_grid": list(CLAHE_GRID),
+            "blackhat_ksize": int(BLACKHAT_KSIZE),
+            "blackhat_mix": float(BLACKHAT_MIX),
+        },
+        "hough": {
+            "threshold": int(HOUGH_THRESHOLD),
+            "min_line_len": int(HOUGH_MIN_LINE_LEN),
+            "max_gap": int(HOUGH_MAX_GAP),
+        },
+        "segments_detected": int(len(segs)),
+        "rules_detected_y_count": int(len(rule_ys)),
         "slanted_debug": slant_dbg,
-        "slanted_lines_selected": int(len(lines_mb)),
+        "slanted_raw_count": int(len(lines_mb_all)),
+        "slanted_selected_count": int(len(lines_mb)),
         "rows_found": int(rows_found),
         "head_rows": [{"row_idx": int(i), "tenure": head_row_tenure.get(i, "NONE")} for i in head_rows],
         "head_rows_count": int(len(head_rows)),
     }
     save_report_json(os.path.join(img_out, "report.json"), report)
-    print(f"✅ Report saved: {os.path.join(img_out, 'report.json')}")
 
+    print(f"deskew={angle:.3f}deg | top={table_top} | bottom={table_bottom} | rules={len(rule_ys)} | slanted_sel={len(lines_mb)} | mode={mode_used} | rows={rows_found} | head={len(head_rows)}")
+    print(f"✅ Saved: {img_out}")
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
     ensure_dir(OUTPUT_DIR)
@@ -746,7 +885,7 @@ def main():
         print(f"❌ No images found in: {INPUT_DIR}")
         return
 
-    print("=== SMART ADAPTIVE EXTRACTION v9 (ROI DESKEW + TOP EARLIEST PEAK + DUAL-SIGNAL BOTTOM + SLOPED ROWS) ===")
+    print("=== SMART ADAPTIVE EXTRACTION v10 (ENHANCED FAINT RULES + INDIVIDUAL LINE DETECTION) ===")
     print(f"Input:  {INPUT_DIR}")
     print(f"Output: {OUTPUT_DIR}")
     print(f"Images found: {len(imgs)}")
@@ -756,7 +895,6 @@ def main():
         process_one_image(p)
 
     print("\n🎯 DONE")
-
 
 if __name__ == "__main__":
     main()
