@@ -1,6 +1,5 @@
 import os
 import cv2
-import json
 import numpy as np
 
 # ============================================================
@@ -8,61 +7,59 @@ import numpy as np
 # ============================================================
 
 INPUT_DIR = "data/from_jeremy/images_aligned_to_first"
-OUTPUT_DIR = "data/processed/smart_adaptive_extraction_batch_v13_1p1_safe_snap"
+OUTPUT_DIR = "data/processed/smart_adaptive_extraction_batch_v18_band_anchor"
 
+# Table priors
 NUM_ROWS = 40
 FIRST_ROW_Y_PRIOR = 1263
-
-# Your measurement priors (keep stable!)
 TABLE_HEIGHT_PX = 3160
 TABLE_WIDTH_PX = 6150
 
+# ROI pads and x-band
 TABLE_X_MARGIN = 140
 ROI_TOP_PAD = 260
 ROI_BOTTOM_PAD = 420
-
-FIRST_LINE_ROI_UP = 340
-FIRST_LINE_ROI_DOWN = 740
 
 # Enhancement knobs
 CLAHE_CLIP = 2.0
 CLAHE_GRID = (8, 8)
 BLACKHAT_KSIZE = 35
+BLACKHAT_MIX = 0.85
 
-# Projection / peak knobs
-PROJ_SMOOTH_K = 31
-PEAK_MIN_REL = 0.26
+# Horizontal mask aggressiveness (auto fallback)
+PEAK_MIN_REL = 0.42
+PROJ_SMOOTH_K = 19
 PEAK_MERGE_DIST = 14
+PEAK_TARGET_GOOD = 28
 
-# Snapping knobs
-SNAP_BAND = 16
-RR_THRESH_PCT = 82
-CONTINUITY_MIN_FRAC = 0.55
-INK_WEIGHT = 1.75
-RR_WEIGHT = 1.0
-CONTINUITY_WEIGHT = 0.65
-LOCAL_SMOOTH_HALF = 2
+# ========= NEW (band-based anchoring) =========
+# Coverage threshold for "this y is a horizontal rule"
+# Higher => stricter (less text). Too high can break faint lines.
+COVER_THRESH = 0.18
 
-# NEW: hard whitespace lock
-HARD_INK_MAX = 0.12   # if ink density > this, separator is forbidden at that y
-HARD_INK_PAD = 3      # require neighborhood around y to be low ink too
+# How many pixels a line-band can be thick before we compress it to a single center
+# (purely for stability)
+BAND_MIN_THICK = 1
+BAND_MAX_THICK = 16
 
-# NEW: keep bottom stable, but allow tiny clamp to avoid footer
-BOTTOM_ADJUST_MAX = 160  # only allow bottom to move ±160px from prior bottom
+# Snapping tolerances (in pixels)
+SNAP_ACCEPT_PX = 6
+PEAK_SEARCH_BAND = 16
 
-TOP_CANDIDATES_MAX = 12
+# Table-top search window around prior
+FIRST_LINE_ROI_UP = 420
+FIRST_LINE_ROI_DOWN = 900
+TOP_CAND_LIMIT = 30
 
-# IMPORTANT: start with slope OFF to avoid drift
-USE_SLOPE = False
+# Scoring
+GRID_SCORE_W_ERR = 0.35
+TOP_PRIOR_PENALTY_W = 0.020  # keep anchor near prior (stronger than before)
 
-# Optional slope (only enable later)
-SLOPE_NUM_WINDOWS = 10
-SLOPE_WIN_OVERLAP = 0.35
-SLOPE_MIN_REL = 0.20
-SLOPE_SEARCH_BAND = 14
+# Output (only these two)
+SAVE_VIZ = True
+SAVE_RULE_RESPONSE_CROP = True
 
-RECT_ROW_H = 78  # not used if you stop saving rows/cells
-
+# Columns (only used for x-band + viz)
 COLUMNS = {
     "street": (629, 718),
     "house_number": (718, 836),
@@ -77,14 +74,9 @@ COLUMNS = {
     "wages": (6433, 6588),
 }
 
-# Save only what you asked (fast)
-SAVE_VIZ = True
-SAVE_DEBUG = True
-SAVE_CELLS = False  # keep False for speed
-
 
 # ============================================================
-# FS helpers
+# Helpers
 # ============================================================
 
 def ensure_dir(p: str) -> None:
@@ -109,11 +101,6 @@ def smooth_1d(x: np.ndarray, k: int) -> np.ndarray:
         k += 1
     return np.convolve(x.astype(np.float32), np.ones(k, dtype=np.float32) / k, mode="same")
 
-
-# ============================================================
-# Enhancement: CLAHE + Blackhat -> rule_response
-# ============================================================
-
 def enhance_faint_rules(gray: np.ndarray):
     clahe = cv2.createCLAHE(clipLimit=float(CLAHE_CLIP), tileGridSize=tuple(CLAHE_GRID))
     g = clahe.apply(gray)
@@ -123,32 +110,13 @@ def enhance_faint_rules(gray: np.ndarray):
         k += 1
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
     blackhat = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, kernel)
-    rule_response = cv2.normalize(blackhat, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    return rule_response
+    rule_response = cv2.normalize(blackhat, None, 0, 255, cv2.NORM_MINMAX)
 
-def robust_ink_mask(gray: np.ndarray) -> np.ndarray:
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    bw = cv2.adaptiveThreshold(
-        blur, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31, 11
-    )
-    ink = 255 - bw
-    ink = cv2.morphologyEx(
-        ink, cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
-        iterations=1
-    )
-    return ink
+    enhanced_gray = cv2.addWeighted(g, 1.0, rule_response, float(BLACKHAT_MIX), 0)
+    return enhanced_gray, rule_response
 
-
-# ============================================================
-# Projections + peaks
-# ============================================================
-
-def row_energy(rr: np.ndarray) -> np.ndarray:
-    return np.sum(rr.astype(np.float32), axis=1)
+def row_energy(mask: np.ndarray) -> np.ndarray:
+    return np.sum(mask.astype(np.float32), axis=1)
 
 def find_peaks_1d(signal: np.ndarray, min_rel: float, merge_dist: int) -> list:
     if signal.size == 0:
@@ -172,159 +140,191 @@ def find_peaks_1d(signal: np.ndarray, min_rel: float, merge_dist: int) -> list:
                 merged[-1] = p
     return merged
 
+def snap_to_nearest(y: int, ys: list, search_band: int, accept_band: int) -> int:
+    """Fail-closed snapping to nearest candidate y in ys."""
+    if not ys:
+        return int(y)
+    lo, hi = int(y - search_band), int(y + search_band)
+    cands = [p for p in ys if lo <= p <= hi]
+    if not cands:
+        return int(y)
+    best = int(min(cands, key=lambda p: abs(p - y)))
+    return best if abs(best - y) <= int(accept_band) else int(y)
 
-# ============================================================
-# Whitespace-safe snapping (HARD)
-# ============================================================
+def bands_from_hmask(hmask: np.ndarray, y0_full: int) -> list:
+    """
+    Convert hmask -> coverage(y) -> contiguous bands -> band center y in FULL coords.
+    This is more reliable than peaks when there are many strong row lines.
+    """
+    h, w = hmask.shape
+    cov = np.sum(hmask > 0, axis=1).astype(np.float32) / float(max(1, w))
+    cov_s = smooth_1d(cov, 9)
 
-def continuity_fraction(rr_row: np.ndarray, thr: float) -> float:
-    return float(np.mean(rr_row.astype(np.float32) >= thr))
+    on = cov_s >= float(COVER_THRESH)
+    ys = np.where(on)[0]
+    if ys.size == 0:
+        return []
 
-def ink_density(ink: np.ndarray, y: int) -> float:
-    h = ink.shape[0]
-    y0 = max(0, y - LOCAL_SMOOTH_HALF)
-    y1 = min(h, y + LOCAL_SMOOTH_HALF + 1)
-    band = ink[y0:y1, :]
-    return float(np.mean(band.astype(np.float32) / 255.0))  # 0..1
+    bands = []
+    start = int(ys[0])
+    prev = int(ys[0])
+    for y in ys[1:]:
+        y = int(y)
+        if y == prev + 1:
+            prev = y
+        else:
+            bands.append((start, prev))
+            start = y
+            prev = y
+    bands.append((start, prev))
 
-def hard_ink_ok(ink: np.ndarray, y: int) -> bool:
-    h = ink.shape[0]
-    lo = max(0, y - HARD_INK_PAD)
-    hi = min(h - 1, y + HARD_INK_PAD)
-    # require every row in neighborhood to be reasonably low ink
-    for yy in range(lo, hi + 1):
-        if ink_density(ink, yy) > HARD_INK_MAX:
-            return False
-    return True
+    centers_full = []
+    for a, b in bands:
+        thick = (b - a + 1)
+        if thick < BAND_MIN_THICK:
+            continue
+        # If a band is very thick, still compress to its center (works well for scan thickness)
+        if thick > BAND_MAX_THICK:
+            c = int(round(0.5 * (a + b)))
+        else:
+            c = int(round(0.5 * (a + b)))
+        centers_full.append(int(c + y0_full))
 
-def separator_score(rr: np.ndarray, ink: np.ndarray, y: int, rr_thr: float) -> float:
-    h = rr.shape[0]
-    if y < 1 or y >= h - 1:
-        return -1e9
-
-    # HARD constraint: don't cut through writing
-    if not hard_ink_ok(ink, y):
-        return -1e9
-
-    rr_row = rr[y, :].astype(np.float32)
-    rr_e = float(np.mean(rr_row / 255.0))
-    cont = continuity_fraction(rr_row, rr_thr)
-    ink_d = ink_density(ink, y)
-
-    cont_penalty = 0.0
-    if cont < CONTINUITY_MIN_FRAC:
-        cont_penalty = (CONTINUITY_MIN_FRAC - cont) * 0.9
-
-    score = (RR_WEIGHT * rr_e) + (CONTINUITY_WEIGHT * cont) - (INK_WEIGHT * ink_d) - cont_penalty
-    return float(score)
-
-def snap_separator(rr: np.ndarray, ink: np.ndarray, y_expected: int, band: int) -> (int, dict):
-    h = rr.shape[0]
-    lo = max(0, int(y_expected - band))
-    hi = min(h - 1, int(y_expected + band))
-
-    rr_thr = float(np.percentile(rr, RR_THRESH_PCT))
-
-    best_y = None
-    best_s = -1e9
-    for y in range(lo, hi + 1):
-        s = separator_score(rr, ink, y, rr_thr)
-        if s > best_s:
-            best_s = s
-            best_y = y
-
-    # If everything was forbidden by hard-ink, fall back to soft scoring (still better than crashing)
-    if best_y is None:
-        # soft fallback: remove hard constraint just for this snap
-        best_y = int(np.clip(y_expected, 0, h - 1))
-        best_s = -1e9
-        for y in range(lo, hi + 1):
-            rr_row = rr[y, :].astype(np.float32)
-            rr_e = float(np.mean(rr_row / 255.0))
-            cont = continuity_fraction(rr_row, rr_thr)
-            ink_d = ink_density(ink, y)
-            s = (RR_WEIGHT * rr_e) + (CONTINUITY_WEIGHT * cont) - (INK_WEIGHT * ink_d)
-            if s > best_s:
-                best_s = s
-                best_y = y
-
-        dbg = {"fallback": "soft_only", "y_expected": int(y_expected), "y_picked": int(best_y), "score": float(best_s)}
-        return int(best_y), dbg
-
-    dbg = {"fallback": None, "y_expected": int(y_expected), "y_picked": int(best_y), "score": float(best_s)}
-    return int(best_y), dbg
+    return sorted(set(centers_full))
 
 
 # ============================================================
-# Grid-aware table top selection (kept from v13.1)
+# Auto-aggressive horizontal mask (kills text, keeps rules)
 # ============================================================
 
-def choose_table_top_gridaware(rr: np.ndarray, ink: np.ndarray, peaks: list, first_prior_in_crop: int) -> (int, dict):
-    if not peaks:
-        return int(first_prior_in_crop), {"picked_from": "prior_fallback_no_peaks"}
+def make_hmask_aggressive(rr_crop: np.ndarray):
+    h, w = rr_crop.shape
+    trials = [
+        {"pctl": 88, "kfrac": 0.30, "dilate": 1},
+        {"pctl": 86, "kfrac": 0.28, "dilate": 1},
+        {"pctl": 84, "kfrac": 0.26, "dilate": 1},
+        {"pctl": 82, "kfrac": 0.24, "dilate": 1},
+        {"pctl": 80, "kfrac": 0.22, "dilate": 1},
+        {"pctl": 78, "kfrac": 0.20, "dilate": 1},
+    ]
 
-    roi_lo = int(first_prior_in_crop - FIRST_LINE_ROI_UP)
-    roi_hi = int(first_prior_in_crop + FIRST_LINE_ROI_DOWN)
+    best = None
 
-    roi_peaks = [p for p in peaks if roi_lo <= p <= roi_hi]
-    if not roi_peaks:
-        nearest = min(peaks, key=lambda p: abs(p - first_prior_in_crop))
-        return int(nearest), {"picked_from": "nearest_peak_fallback", "roi_lo": roi_lo, "roi_hi": roi_hi}
+    for t in trials:
+        thr = int(np.percentile(rr_crop, t["pctl"]))
+        thr = max(10, min(240, thr))
+        bw = (rr_crop >= thr).astype(np.uint8) * 255
 
-    energy = row_energy(rr)
-    roi_peaks = sorted(roi_peaks, key=lambda p: energy[p], reverse=True)[:TOP_CANDIDATES_MAX]
+        klen = int(max(180, w * float(t["kfrac"])))
+        if klen % 2 == 0:
+            klen += 1
 
-    best_top = int(roi_peaks[0])
-    best_score = -1e9
-    best_detail = None
+        hk = cv2.getStructuringElement(cv2.MORPH_RECT, (klen, 1))
+        opened = cv2.morphologyEx(bw, cv2.MORPH_OPEN, hk)
 
+        if int(t["dilate"]) > 0:
+            dk = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1))
+            opened = cv2.dilate(opened, dk, iterations=int(t["dilate"]))
+
+        # keep the old peak metric just to decide "good enough"
+        energy = row_energy(opened)
+        energy_s = smooth_1d(energy, PROJ_SMOOTH_K)
+        peaks = find_peaks_1d(energy_s, min_rel=PEAK_MIN_REL, merge_dist=PEAK_MERGE_DIST)
+        peak_count = len(peaks)
+
+        dbg = f"pctl={t['pctl']} kfrac={t['kfrac']:.2f} klen={klen} thr={thr} peaks={peak_count}"
+
+        if best is None or peak_count > best["peak_count"]:
+            best = {"hmask": opened, "peak_count": peak_count, "dbg": dbg}
+
+        if peak_count >= int(PEAK_TARGET_GOOD):
+            return opened, dbg
+
+    return best["hmask"], f"(fallback best) {best['dbg']}"
+
+
+# ============================================================
+# Table anchor selection using BANDS (not peaks)
+# ============================================================
+
+def choose_table_top_by_band_grid(band_lines_full: list, first_y_prior: int):
+    """
+    Choose table_top among band lines by:
+      - how well a uniform 40-row grid snaps to band lines (41 lines)
+      - soft penalty away from prior
+    This avoids starting mid-table.
+    """
+    if not band_lines_full:
+        return int(first_y_prior), "(no bands; prior fallback)"
+
+    roi_lo = int(first_y_prior - FIRST_LINE_ROI_UP)
+    roi_hi = int(first_y_prior + FIRST_LINE_ROI_DOWN)
+
+    cands = [y for y in band_lines_full if roi_lo <= y <= roi_hi]
+    if not cands:
+        nearest = int(min(band_lines_full, key=lambda y: abs(y - first_y_prior)))
+        return nearest, "(no top bands in ROI; nearest fallback)"
+
+    # try tops closest to prior (don’t let it drift)
+    cands = sorted(cands, key=lambda y: abs(y - first_y_prior))[:int(TOP_CAND_LIMIT)]
     step = float(TABLE_HEIGHT_PX) / float(NUM_ROWS)
 
-    for cand_top in roi_peaks:
-        total = 0.0
-        snaps = 0
-        dbg_snaps = []
+    best_score = None
+    best_top = None
+
+    for top in cands:
+        good = 0
+        errs = []
+
         for i in range(NUM_ROWS + 1):
-            y_exp = int(round(cand_top + i * step))
-            if y_exp < 0 or y_exp >= rr.shape[0]:
-                continue
-            y_pick, dbg = snap_separator(rr, ink, y_exp, band=SNAP_BAND)
-            total += dbg["score"]
-            snaps += 1
-            if i in (0, 1, 2, 20, 39, 40):
-                dbg_snaps.append(dbg)
+            ye = float(top + i * step)
+            ys = snap_to_nearest(int(round(ye)), band_lines_full,
+                                 search_band=PEAK_SEARCH_BAND,
+                                 accept_band=SNAP_ACCEPT_PX)
+            err = abs(float(ys) - ye)
+            if err <= float(SNAP_ACCEPT_PX):
+                good += 1
+                errs.append(err)
 
-        avg = total / max(1, snaps)
-        dist_pen = 0.0009 * float(abs(cand_top - first_prior_in_crop))
-        score = avg - dist_pen
-        if score > best_score:
+        avg_err = float(np.mean(errs)) if errs else 999.0
+        score = float(good) - float(GRID_SCORE_W_ERR) * avg_err
+
+        # strong-ish prior penalty: prevents mid-table anchoring
+        score -= float(TOP_PRIOR_PENALTY_W) * abs(float(top) - float(first_y_prior))
+
+        if best_score is None or score > best_score:
             best_score = score
-            best_top = int(cand_top)
-            best_detail = {"candidate_top": int(cand_top), "avg_score": float(avg), "dist_pen": float(dist_pen),
-                           "score": float(score), "sample_snaps": dbg_snaps}
+            best_top = int(top)
 
-    return best_top, {"picked_from": "gridaware_top_scoring", "roi_lo": roi_lo, "roi_hi": roi_hi,
-                      "best": best_detail, "candidates_considered": [int(p) for p in roi_peaks]}
+    dbg = f"(band grid) top={best_top} score={best_score:.2f} cands={len(cands)} bands={len(band_lines_full)}"
+    return int(best_top), dbg
 
 
 # ============================================================
-# Visualization (draw ONLY inside crop x-band to protect street later)
+# Visualization
 # ============================================================
 
-def draw_overlay(gray: np.ndarray, columns: dict, y_seps_full: list, xL: int, xR: int, out_path: str, title: str):
+def draw_overlay(gray: np.ndarray, columns: dict, lines_y: list,
+                 table_top: int, table_bottom: int,
+                 out_path: str, title: str, xL: int, xR: int):
     viz = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     h, w = gray.shape
 
     if title:
         cv2.putText(viz, title, (40, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 180, 0), 2)
 
-    # vertical guides (current fixed columns)
     for _, (a, b) in columns.items():
         cv2.line(viz, (a, 0), (a, h), (255, 0, 0), 2)
         cv2.line(viz, (b, 0), (b, h), (255, 0, 0), 2)
 
-    # draw row lines only across [xL..xR]
-    for y in y_seps_full:
+    cv2.line(viz, (xL, 0), (xL, h), (150, 150, 0), 2)
+    cv2.line(viz, (xR, 0), (xR, h), (150, 150, 0), 2)
+
+    cv2.line(viz, (0, table_top), (w, table_top), (255, 255, 0), 2)
+    cv2.line(viz, (0, table_bottom), (w, table_bottom), (0, 255, 255), 3)
+
+    for y in lines_y:
+        y = int(np.clip(y, 0, h - 1))
         cv2.line(viz, (xL, y), (xR, y), (0, 0, 255), 2)
 
     ensure_dir(os.path.dirname(out_path))
@@ -332,7 +332,7 @@ def draw_overlay(gray: np.ndarray, columns: dict, y_seps_full: list, xL: int, xR
 
 
 # ============================================================
-# Per-image
+# Main per-image
 # ============================================================
 
 def process_one_image(img_path: str) -> None:
@@ -345,8 +345,8 @@ def process_one_image(img_path: str) -> None:
         return
 
     h, w = gray.shape
-    out_dir = os.path.join(OUTPUT_DIR, name)
-    ensure_dir(out_dir)
+    img_out = os.path.join(OUTPUT_DIR, name)
+    ensure_dir(img_out)
 
     # X band from known columns
     min_x1 = min(v[0] for v in COLUMNS.values())
@@ -358,76 +358,44 @@ def process_one_image(img_path: str) -> None:
     # Crop around expected table band
     y0 = max(0, FIRST_ROW_Y_PRIOR - ROI_TOP_PAD)
     y1 = min(h, FIRST_ROW_Y_PRIOR + TABLE_HEIGHT_PX + ROI_BOTTOM_PAD)
+    crop = gray[y0:y1, xL:xR]
 
-    crop_gray = gray[y0:y1, xL:xR]
-    rr = enhance_faint_rules(crop_gray)
-    ink = robust_ink_mask(crop_gray)
+    # Rule response (save)
+    _, rr_crop = enhance_faint_rules(crop)
 
-    # Peaks as candidates
-    e = row_energy(rr)
-    e_s = smooth_1d(e, PROJ_SMOOTH_K)
-    peaks = find_peaks_1d(e_s, min_rel=PEAK_MIN_REL, merge_dist=PEAK_MERGE_DIST)
+    # Horizontal mask (aggressive, auto fallback)
+    hmask, dbg_h = make_hmask_aggressive(rr_crop)
 
-    first_prior_in_crop = int(FIRST_ROW_Y_PRIOR - y0)
-    top_c, top_dbg = choose_table_top_gridaware(rr, ink, peaks, first_prior_in_crop)
+    # Convert hmask -> band lines (FULL coords)
+    band_lines_full = bands_from_hmask(hmask, y0_full=y0)
 
-    # STABLE bottom from measured height
-    bottom_prior = int(min(rr.shape[0] - 1, top_c + TABLE_HEIGHT_PX))
+    # Choose table_top using band-grid scoring
+    table_top, dbg_top = choose_table_top_by_band_grid(band_lines_full, FIRST_ROW_Y_PRIOR)
+    table_bottom = int(table_top + TABLE_HEIGHT_PX)
 
-    # Tiny bottom clamp only (prevents 1 extra row leaking into footer)
-    # We just choose the best whitespace-safe separator near bottom prior.
-    bottom_c, bottom_dbg = snap_separator(rr, ink, bottom_prior, band=BOTTOM_ADJUST_MAX)
-
-    # Build exactly 41 separators by expected spacing between (top..bottom)
-    span = max(2400, int(bottom_c - top_c))
-    step = float(span) / float(NUM_ROWS)
-
-    y_seps_crop = []
-    snap_debug = []
+    # Build 41 separators using bands as the snapping targets
+    step = float(TABLE_HEIGHT_PX) / float(NUM_ROWS)
+    lines_y = []
     for i in range(NUM_ROWS + 1):
-        y_exp = int(round(top_c + i * step))
-        y_pick, dbg = snap_separator(rr, ink, y_exp, band=SNAP_BAND)
-        y_seps_crop.append(int(y_pick))
-        if i in (0, 1, 2, 20, 39, 40):
-            snap_debug.append(dbg)
+        y_expect = int(round(table_top + i * step))
+        y_snap = snap_to_nearest(y_expect, band_lines_full,
+                                 search_band=PEAK_SEARCH_BAND,
+                                 accept_band=SNAP_ACCEPT_PX)
+        lines_y.append(int(y_snap))
 
-    # Convert crop separators to full image y
-    y_seps_full = [int(y + y0) for y in y_seps_crop]
+    # Save ONLY requested outputs
+    if SAVE_RULE_RESPONSE_CROP:
+        cv2.imwrite(os.path.join(img_out, "debug_rule_response_crop.png"), rr_crop)
 
     if SAVE_VIZ:
-        viz_path = os.path.join(out_dir, "grid_overlay.png")
-        title = f"{name} | peaks={len(peaks)} | top={top_c+y0} bottom={bottom_c+y0}"
-        draw_overlay(gray, COLUMNS, y_seps_full, xL, xR, viz_path, title)
+        viz_path = os.path.join(img_out, "grid_overlay.png")
+        title = f"{name} | {dbg_h} | {dbg_top}"
+        draw_overlay(gray, COLUMNS, lines_y, table_top, table_bottom, viz_path, title, xL, xR)
 
-    if SAVE_DEBUG:
-        # Keep debug minimal for speed
-        cv2.imwrite(os.path.join(out_dir, "debug_rule_response_crop.png"), rr)
-        cv2.imwrite(os.path.join(out_dir, "debug_ink_crop.png"), ink)
-
-    report = {
-        "image_name": name,
-        "source_path": img_path,
-        "x_band": {"xL": int(xL), "xR": int(xR)},
-        "crop": {"y0": int(y0), "y1": int(y1)},
-        "top_c_full": int(top_c + y0),
-        "bottom_c_full": int(bottom_c + y0),
-        "bottom_prior_full": int(bottom_prior + y0),
-        "bottom_snap": bottom_dbg,
-        "rows_expected": int(NUM_ROWS),
-        "separators_count": int(len(y_seps_full)),
-        "separators_full": [int(y) for y in y_seps_full],
-        "peaks_count": int(len(peaks)),
-        "top_selection": top_dbg,
-        "snap_debug_samples": snap_debug,
-        "hard_ink_max": float(HARD_INK_MAX),
-        "note": "v13.1p1: stable 3160px height + hard ink rejection snap. Draws separators only inside table x-band.",
-    }
-
-    with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
-
-    print(f"top={top_c+y0} bottom={bottom_c+y0} peaks={len(peaks)} sep={len(y_seps_full)}")
-    print(f"✅ Saved: {out_dir}")
+    print(dbg_h)
+    print(dbg_top)
+    print(f"table_top={table_top} bottom={table_bottom} bands={len(band_lines_full)}")
+    print(f"✅ Saved: {img_out}")
 
 
 # ============================================================
@@ -436,16 +404,16 @@ def process_one_image(img_path: str) -> None:
 
 def main():
     ensure_dir(OUTPUT_DIR)
+
     imgs = list_images(INPUT_DIR)
     if not imgs:
         print(f"❌ No images found in: {INPUT_DIR}")
         return
 
-    print("=== SMART ADAPTIVE EXTRACTION v13.1p1 (HARD WHITESPACE SNAP + STABLE HEIGHT) ===")
+    print("=== SMART ADAPTIVE EXTRACTION v18 (HMASK + BAND ANCHOR) ===")
     print(f"Input:  {INPUT_DIR}")
     print(f"Output: {OUTPUT_DIR}")
     print(f"Images found: {len(imgs)}")
-    print(f"HARD_INK_MAX={HARD_INK_MAX} | USE_SLOPE={USE_SLOPE}")
 
     for i, p in enumerate(imgs, start=1):
         print(f"\n[{i}/{len(imgs)}]")
