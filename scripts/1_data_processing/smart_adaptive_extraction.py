@@ -1,5 +1,6 @@
 import os
 import cv2
+import json
 import numpy as np
 
 # ============================================================
@@ -7,15 +8,13 @@ import numpy as np
 # ============================================================
 
 INPUT_DIR = "data/from_jeremy/images_aligned_to_first"
-OUTPUT_DIR = "data/processed/smart_adaptive_extraction_batch_v18_band_anchor"
+OUTPUT_DIR = "data/processed/smart_adaptive_extraction_batch_v19_gated_snap"
 
-# Table priors
 NUM_ROWS = 40
 FIRST_ROW_Y_PRIOR = 1263
 TABLE_HEIGHT_PX = 3160
 TABLE_WIDTH_PX = 6150
 
-# ROI pads and x-band
 TABLE_X_MARGIN = 140
 ROI_TOP_PAD = 260
 ROI_BOTTOM_PAD = 420
@@ -26,40 +25,46 @@ CLAHE_GRID = (8, 8)
 BLACKHAT_KSIZE = 35
 BLACKHAT_MIX = 0.85
 
-# Horizontal mask aggressiveness (auto fallback)
-PEAK_MIN_REL = 0.42
-PROJ_SMOOTH_K = 19
-PEAK_MERGE_DIST = 14
-PEAK_TARGET_GOOD = 28
+# Horizontal mask trials (same spirit as your working v19/v18)
+HMASK_TRIALS = [
+    {"pctl": 88, "kfrac": 0.30, "dilate": 1},
+    {"pctl": 86, "kfrac": 0.28, "dilate": 1},
+    {"pctl": 84, "kfrac": 0.26, "dilate": 1},
+    {"pctl": 82, "kfrac": 0.24, "dilate": 1},
+    {"pctl": 80, "kfrac": 0.22, "dilate": 1},
+    {"pctl": 78, "kfrac": 0.20, "dilate": 1},
+    {"pctl": 76, "kfrac": 0.18, "dilate": 1},
+    {"pctl": 74, "kfrac": 0.16, "dilate": 1},
+]
 
-# ========= NEW (band-based anchoring) =========
-# Coverage threshold for "this y is a horizontal rule"
-# Higher => stricter (less text). Too high can break faint lines.
-COVER_THRESH = 0.18
+COVER_THRESH_START = 0.22
+COVER_THRESH_MIN = 0.10
+COVER_THRESH_STEP = 0.02
 
-# How many pixels a line-band can be thick before we compress it to a single center
-# (purely for stability)
-BAND_MIN_THICK = 1
-BAND_MAX_THICK = 16
+# Snap knobs
+SNAP_SEARCH_BAND = 18
+SNAP_ACCEPT_PX = 8
 
-# Snapping tolerances (in pixels)
-SNAP_ACCEPT_PX = 6
-PEAK_SEARCH_BAND = 16
+# Bottom anchor
+BOTTOM_EXPECT = FIRST_ROW_Y_PRIOR + TABLE_HEIGHT_PX
+BOTTOM_SEARCH_BAND = 650
+BOTTOM_PICK_MIN_COV = 0.12
 
-# Table-top search window around prior
-FIRST_LINE_ROI_UP = 420
-FIRST_LINE_ROI_DOWN = 900
-TOP_CAND_LIMIT = 30
+# ============================================================
+# NEW: Confidence-gated snapping (THIS IS THE FIX)
+# ============================================================
 
-# Scoring
-GRID_SCORE_W_ERR = 0.35
-TOP_PRIOR_PENALTY_W = 0.020  # keep anchor near prior (stronger than before)
+# Only snap to a band if it looks like a printed rule (not handwriting)
+STRONG_RULE_COV = 0.22     # if too strict -> lower to 0.18; if still snapping into text -> raise to 0.26
+MAX_ROW_SHIFT = 6          # max pixels we allow a snap to move from expected grid position
 
-# Output (only these two)
-SAVE_VIZ = True
-SAVE_RULE_RESPONSE_CROP = True
+# If an image has many “unsafe snap candidates” we flag it into faulty_images.txt
+FAULTY_MIN_UNSAFE_ROWS = 3
 
-# Columns (only used for x-band + viz)
+# ============================================================
+# Columns (only used to set x band). Keep as your current values.
+# ============================================================
+
 COLUMNS = {
     "street": (629, 718),
     "house_number": (718, 836),
@@ -73,6 +78,10 @@ COLUMNS = {
     "hours_worked": (4939, 5092),
     "wages": (6433, 6588),
 }
+
+# Outputs
+SAVE_VIZ = True
+SAVE_DEBUG_RULE_RESPONSE = True
 
 
 # ============================================================
@@ -115,55 +124,39 @@ def enhance_faint_rules(gray: np.ndarray):
     enhanced_gray = cv2.addWeighted(g, 1.0, rule_response, float(BLACKHAT_MIX), 0)
     return enhanced_gray, rule_response
 
-def row_energy(mask: np.ndarray) -> np.ndarray:
-    return np.sum(mask.astype(np.float32), axis=1)
 
-def find_peaks_1d(signal: np.ndarray, min_rel: float, merge_dist: int) -> list:
-    if signal.size == 0:
-        return []
-    s = signal.astype(np.float32).copy()
-    s -= float(np.min(s))
-    mx = float(np.max(s)) if float(np.max(s)) > 0 else 1.0
-    s /= mx
+# ============================================================
+# Horizontal mask -> bands
+# ============================================================
 
-    peaks = []
-    for i in range(1, len(s) - 1):
-        if s[i] > s[i - 1] and s[i] > s[i + 1] and s[i] >= float(min_rel):
-            peaks.append(i)
+def make_hmask(rr_crop: np.ndarray, pctl: int, kfrac: float, dilate: int):
+    h, w = rr_crop.shape
+    thr = int(np.percentile(rr_crop, pctl))
+    thr = max(8, min(240, thr))
+    bw = (rr_crop >= thr).astype(np.uint8) * 255
 
-    merged = []
-    for p in peaks:
-        if not merged or abs(p - merged[-1]) > int(merge_dist):
-            merged.append(p)
-        else:
-            if signal[p] > signal[merged[-1]]:
-                merged[-1] = p
-    return merged
+    klen = int(max(180, w * float(kfrac)))
+    if klen % 2 == 0:
+        klen += 1
 
-def snap_to_nearest(y: int, ys: list, search_band: int, accept_band: int) -> int:
-    """Fail-closed snapping to nearest candidate y in ys."""
-    if not ys:
-        return int(y)
-    lo, hi = int(y - search_band), int(y + search_band)
-    cands = [p for p in ys if lo <= p <= hi]
-    if not cands:
-        return int(y)
-    best = int(min(cands, key=lambda p: abs(p - y)))
-    return best if abs(best - y) <= int(accept_band) else int(y)
+    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (klen, 1))
+    opened = cv2.morphologyEx(bw, cv2.MORPH_OPEN, hk)
 
-def bands_from_hmask(hmask: np.ndarray, y0_full: int) -> list:
-    """
-    Convert hmask -> coverage(y) -> contiguous bands -> band center y in FULL coords.
-    This is more reliable than peaks when there are many strong row lines.
-    """
+    if int(dilate) > 0:
+        dk = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1))
+        opened = cv2.dilate(opened, dk, iterations=int(dilate))
+
+    return opened, thr, klen
+
+def bands_from_hmask(hmask: np.ndarray, y0_full: int, cover_thresh: float):
     h, w = hmask.shape
-    cov = np.sum(hmask > 0, axis=1).astype(np.float32) / float(max(1, w))
+    cov = (np.sum(hmask > 0, axis=1).astype(np.float32) / float(max(1, w)))
     cov_s = smooth_1d(cov, 9)
 
-    on = cov_s >= float(COVER_THRESH)
+    on = cov_s >= float(cover_thresh)
     ys = np.where(on)[0]
     if ys.size == 0:
-        return []
+        return [], cov_s
 
     bands = []
     start = int(ys[0])
@@ -178,151 +171,138 @@ def bands_from_hmask(hmask: np.ndarray, y0_full: int) -> list:
             prev = y
     bands.append((start, prev))
 
-    centers_full = []
+    out = []
     for a, b in bands:
         thick = (b - a + 1)
-        if thick < BAND_MIN_THICK:
-            continue
-        # If a band is very thick, still compress to its center (works well for scan thickness)
-        if thick > BAND_MAX_THICK:
-            c = int(round(0.5 * (a + b)))
-        else:
-            c = int(round(0.5 * (a + b)))
-        centers_full.append(int(c + y0_full))
+        c = int(round(0.5 * (a + b)))
+        mean_cov = float(np.mean(cov_s[a:b+1]))
+        out.append({
+            "center_full": int(c + y0_full),
+            "thick": int(thick),
+            "mean_cov": float(mean_cov),
+        })
 
-    return sorted(set(centers_full))
+    # dedupe by center
+    seen = set()
+    uniq = []
+    for d in sorted(out, key=lambda z: z["center_full"]):
+        if d["center_full"] not in seen:
+            uniq.append(d)
+            seen.add(d["center_full"])
+    return uniq, cov_s
 
-
-# ============================================================
-# Auto-aggressive horizontal mask (kills text, keeps rules)
-# ============================================================
-
-def make_hmask_aggressive(rr_crop: np.ndarray):
-    h, w = rr_crop.shape
-    trials = [
-        {"pctl": 88, "kfrac": 0.30, "dilate": 1},
-        {"pctl": 86, "kfrac": 0.28, "dilate": 1},
-        {"pctl": 84, "kfrac": 0.26, "dilate": 1},
-        {"pctl": 82, "kfrac": 0.24, "dilate": 1},
-        {"pctl": 80, "kfrac": 0.22, "dilate": 1},
-        {"pctl": 78, "kfrac": 0.20, "dilate": 1},
-    ]
-
+def build_bands_auto(rr_crop: np.ndarray, y0_full: int):
     best = None
 
-    for t in trials:
-        thr = int(np.percentile(rr_crop, t["pctl"]))
-        thr = max(10, min(240, thr))
-        bw = (rr_crop >= thr).astype(np.uint8) * 255
+    for t in HMASK_TRIALS:
+        hmask, thr, klen = make_hmask(rr_crop, t["pctl"], t["kfrac"], t["dilate"])
+        cover = float(COVER_THRESH_START)
 
-        klen = int(max(180, w * float(t["kfrac"])))
-        if klen % 2 == 0:
-            klen += 1
+        while cover >= float(COVER_THRESH_MIN):
+            bands, _ = bands_from_hmask(hmask, y0_full=y0_full, cover_thresh=cover)
 
-        hk = cv2.getStructuringElement(cv2.MORPH_RECT, (klen, 1))
-        opened = cv2.morphologyEx(bw, cv2.MORPH_OPEN, hk)
+            bottom_cands = [b for b in bands if abs(b["center_full"] - BOTTOM_EXPECT) <= BOTTOM_SEARCH_BAND]
+            bottom_strength = max((b["mean_cov"] for b in bottom_cands), default=0.0)
 
-        if int(t["dilate"]) > 0:
-            dk = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1))
-            opened = cv2.dilate(opened, dk, iterations=int(t["dilate"]))
+            score = len(bands) + 15.0 * bottom_strength
 
-        # keep the old peak metric just to decide "good enough"
-        energy = row_energy(opened)
-        energy_s = smooth_1d(energy, PROJ_SMOOTH_K)
-        peaks = find_peaks_1d(energy_s, min_rel=PEAK_MIN_REL, merge_dist=PEAK_MERGE_DIST)
-        peak_count = len(peaks)
+            if (best is None) or (score > best["score"]):
+                best = {
+                    "score": score,
+                    "bands": bands,
+                    "dbg": f"(best) pctl={t['pctl']} kfrac={t['kfrac']:.2f} thr={thr} klen={klen} bands={len(bands)} cover={cover:.2f} bottom_str={bottom_strength:.3f}"
+                }
 
-        dbg = f"pctl={t['pctl']} kfrac={t['kfrac']:.2f} klen={klen} thr={thr} peaks={peak_count}"
+            if len(bands) >= 25:
+                break
 
-        if best is None or peak_count > best["peak_count"]:
-            best = {"hmask": opened, "peak_count": peak_count, "dbg": dbg}
+            cover -= float(COVER_THRESH_STEP)
 
-        if peak_count >= int(PEAK_TARGET_GOOD):
-            return opened, dbg
+    if best is None:
+        return [], [], "(no bands)"
 
-    return best["hmask"], f"(fallback best) {best['dbg']}"
+    band_centers = [b["center_full"] for b in best["bands"]]
+    return best["bands"], band_centers, best["dbg"]
 
+def choose_bottom_anchor(bands: list):
+    if not bands:
+        return int(BOTTOM_EXPECT), "(no bands; bottom=prior)"
 
-# ============================================================
-# Table anchor selection using BANDS (not peaks)
-# ============================================================
-
-def choose_table_top_by_band_grid(band_lines_full: list, first_y_prior: int):
-    """
-    Choose table_top among band lines by:
-      - how well a uniform 40-row grid snaps to band lines (41 lines)
-      - soft penalty away from prior
-    This avoids starting mid-table.
-    """
-    if not band_lines_full:
-        return int(first_y_prior), "(no bands; prior fallback)"
-
-    roi_lo = int(first_y_prior - FIRST_LINE_ROI_UP)
-    roi_hi = int(first_y_prior + FIRST_LINE_ROI_DOWN)
-
-    cands = [y for y in band_lines_full if roi_lo <= y <= roi_hi]
+    cands = [b for b in bands if abs(b["center_full"] - BOTTOM_EXPECT) <= BOTTOM_SEARCH_BAND]
     if not cands:
-        nearest = int(min(band_lines_full, key=lambda y: abs(y - first_y_prior)))
-        return nearest, "(no top bands in ROI; nearest fallback)"
+        best = max(bands, key=lambda b: (b["mean_cov"], b["thick"]))
+        return int(best["center_full"]), "(bottom fallback strongest)"
 
-    # try tops closest to prior (don’t let it drift)
-    cands = sorted(cands, key=lambda y: abs(y - first_y_prior))[:int(TOP_CAND_LIMIT)]
-    step = float(TABLE_HEIGHT_PX) / float(NUM_ROWS)
+    best = max(cands, key=lambda b: (b["mean_cov"], b["thick"], -abs(b["center_full"] - BOTTOM_EXPECT)))
+    if best["mean_cov"] < float(BOTTOM_PICK_MIN_COV):
+        return int(BOTTOM_EXPECT), "(bottom too weak; prior)"
 
-    best_score = None
-    best_top = None
+    return int(best["center_full"]), "(bottom anchored)"
 
-    for top in cands:
-        good = 0
-        errs = []
 
-        for i in range(NUM_ROWS + 1):
-            ye = float(top + i * step)
-            ys = snap_to_nearest(int(round(ye)), band_lines_full,
-                                 search_band=PEAK_SEARCH_BAND,
-                                 accept_band=SNAP_ACCEPT_PX)
-            err = abs(float(ys) - ye)
-            if err <= float(SNAP_ACCEPT_PX):
-                good += 1
-                errs.append(err)
+# ============================================================
+# NEW: confidence-gated snapping
+# ============================================================
 
-        avg_err = float(np.mean(errs)) if errs else 999.0
-        score = float(good) - float(GRID_SCORE_W_ERR) * avg_err
+def nearest_band_candidate(y_expect: int, bands: list, search_band: int):
+    """
+    Return the nearest band dict within ±search_band, else None.
+    """
+    lo = int(y_expect - search_band)
+    hi = int(y_expect + search_band)
+    cands = [b for b in bands if lo <= b["center_full"] <= hi]
+    if not cands:
+        return None
+    return min(cands, key=lambda b: abs(b["center_full"] - y_expect))
 
-        # strong-ish prior penalty: prevents mid-table anchoring
-        score -= float(TOP_PRIOR_PENALTY_W) * abs(float(top) - float(first_y_prior))
+def gated_snap(y_expect: int, bands: list) -> (int, bool, str):
+    """
+    Snap only if:
+      - nearest band exists
+      - band mean_cov >= STRONG_RULE_COV
+      - abs shift <= MAX_ROW_SHIFT
+    Returns: (y_final, snapped_bool, reason)
+    """
+    cand = nearest_band_candidate(y_expect, bands, SNAP_SEARCH_BAND)
+    if cand is None:
+        return int(y_expect), False, "no_candidate"
 
-        if best_score is None or score > best_score:
-            best_score = score
-            best_top = int(top)
+    y_c = int(cand["center_full"])
+    shift = abs(y_c - int(y_expect))
 
-    dbg = f"(band grid) top={best_top} score={best_score:.2f} cands={len(cands)} bands={len(band_lines_full)}"
-    return int(best_top), dbg
+    if cand["mean_cov"] < float(STRONG_RULE_COV):
+        return int(y_expect), False, f"weak_cov({cand['mean_cov']:.3f})"
+
+    if shift > int(MAX_ROW_SHIFT):
+        return int(y_expect), False, f"shift_too_big({shift})"
+
+    if shift > int(SNAP_ACCEPT_PX):
+        return int(y_expect), False, f"outside_accept({shift})"
+
+    return int(y_c), True, "snapped_ok"
 
 
 # ============================================================
 # Visualization
 # ============================================================
 
-def draw_overlay(gray: np.ndarray, columns: dict, lines_y: list,
-                 table_top: int, table_bottom: int,
+def draw_overlay(gray: np.ndarray, lines_y: list, table_top: int, table_bottom: int,
                  out_path: str, title: str, xL: int, xR: int):
     viz = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     h, w = gray.shape
 
     if title:
-        cv2.putText(viz, title, (40, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 180, 0), 2)
+        cv2.putText(viz, title, (40, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
 
-    for _, (a, b) in columns.items():
-        cv2.line(viz, (a, 0), (a, h), (255, 0, 0), 2)
-        cv2.line(viz, (b, 0), (b, h), (255, 0, 0), 2)
-
+    # x band bounds
     cv2.line(viz, (xL, 0), (xL, h), (150, 150, 0), 2)
     cv2.line(viz, (xR, 0), (xR, h), (150, 150, 0), 2)
 
+    # table top/bottom
     cv2.line(viz, (0, table_top), (w, table_top), (255, 255, 0), 2)
     cv2.line(viz, (0, table_bottom), (w, table_bottom), (0, 255, 255), 3)
 
+    # horizontal lines (only across table x-band)
     for y in lines_y:
         y = int(np.clip(y, 0, h - 1))
         cv2.line(viz, (xL, y), (xR, y), (0, 0, 255), 2)
@@ -332,19 +312,19 @@ def draw_overlay(gray: np.ndarray, columns: dict, lines_y: list,
 
 
 # ============================================================
-# Main per-image
+# Per-image
 # ============================================================
 
-def process_one_image(img_path: str) -> None:
+def process_one_image(img_path: str):
     name = os.path.splitext(os.path.basename(img_path))[0]
     print(f"\n=== Processing: {name} ===")
 
     gray = read_gray(img_path)
     if gray is None:
         print("⚠️ Could not read image. Skipping.")
-        return
+        return None
 
-    h, w = gray.shape
+    H, W = gray.shape
     img_out = os.path.join(OUTPUT_DIR, name)
     ensure_dir(img_out)
 
@@ -352,50 +332,58 @@ def process_one_image(img_path: str) -> None:
     min_x1 = min(v[0] for v in COLUMNS.values())
     xL = int(min_x1 - TABLE_X_MARGIN)
     xR = int(xL + TABLE_WIDTH_PX + 2 * TABLE_X_MARGIN)
-    xL = max(0, min(w - 2, xL))
-    xR = max(xL + 1, min(w - 1, xR))
+    xL = max(0, min(W - 2, xL))
+    xR = max(xL + 1, min(W - 1, xR))
 
     # Crop around expected table band
     y0 = max(0, FIRST_ROW_Y_PRIOR - ROI_TOP_PAD)
-    y1 = min(h, FIRST_ROW_Y_PRIOR + TABLE_HEIGHT_PX + ROI_BOTTOM_PAD)
+    y1 = min(H, FIRST_ROW_Y_PRIOR + TABLE_HEIGHT_PX + ROI_BOTTOM_PAD)
     crop = gray[y0:y1, xL:xR]
 
-    # Rule response (save)
+    # Rule response (debug)
     _, rr_crop = enhance_faint_rules(crop)
 
-    # Horizontal mask (aggressive, auto fallback)
-    hmask, dbg_h = make_hmask_aggressive(rr_crop)
+    # Bands + bottom anchor
+    bands, band_centers, dbg_bands = build_bands_auto(rr_crop, y0_full=y0)
+    table_bottom, dbg_bottom = choose_bottom_anchor(bands)
+    table_top = int(table_bottom - TABLE_HEIGHT_PX)
 
-    # Convert hmask -> band lines (FULL coords)
-    band_lines_full = bands_from_hmask(hmask, y0_full=y0)
-
-    # Choose table_top using band-grid scoring
-    table_top, dbg_top = choose_table_top_by_band_grid(band_lines_full, FIRST_ROW_Y_PRIOR)
-    table_bottom = int(table_top + TABLE_HEIGHT_PX)
-
-    # Build 41 separators using bands as the snapping targets
+    # Build expected grid and apply gated snapping
     step = float(TABLE_HEIGHT_PX) / float(NUM_ROWS)
     lines_y = []
+    snapped_count = 0
+    unsafe_count = 0
+    reasons = {}
+
     for i in range(NUM_ROWS + 1):
         y_expect = int(round(table_top + i * step))
-        y_snap = snap_to_nearest(y_expect, band_lines_full,
-                                 search_band=PEAK_SEARCH_BAND,
-                                 accept_band=SNAP_ACCEPT_PX)
-        lines_y.append(int(y_snap))
+        y_final, snapped, reason = gated_snap(y_expect, bands)
+        lines_y.append(int(y_final))
+        if snapped:
+            snapped_count += 1
+        else:
+            # count "unsafe" cases where we *would* have snapped but refused
+            if reason.startswith("weak_cov") or reason.startswith("shift_too_big") or reason.startswith("outside_accept"):
+                unsafe_count += 1
+            reasons[reason] = reasons.get(reason, 0) + 1
 
-    # Save ONLY requested outputs
-    if SAVE_RULE_RESPONSE_CROP:
+    # Save requested outputs
+    if SAVE_DEBUG_RULE_RESPONSE:
         cv2.imwrite(os.path.join(img_out, "debug_rule_response_crop.png"), rr_crop)
 
     if SAVE_VIZ:
-        viz_path = os.path.join(img_out, "grid_overlay.png")
-        title = f"{name} | {dbg_h} | {dbg_top}"
-        draw_overlay(gray, COLUMNS, lines_y, table_top, table_bottom, viz_path, title, xL, xR)
+        title = f"{name} | {dbg_bands} | {dbg_bottom} | snapped={snapped_count} unsafe_refused={unsafe_count}"
+        draw_overlay(gray, lines_y, table_top, table_bottom,
+                     os.path.join(img_out, "grid_overlay.png"),
+                     title=title, xL=xL, xR=xR)
 
-    print(dbg_h)
-    print(dbg_top)
-    print(f"table_top={table_top} bottom={table_bottom} bands={len(band_lines_full)}")
-    print(f"✅ Saved: {img_out}")
+    print(f"{dbg_bands} {dbg_bottom}")
+    print(f"table_top={table_top} bottom={table_bottom} snapped={snapped_count} unsafe_refused={unsafe_count}")
+    return {
+        "name": name,
+        "unsafe_refused": unsafe_count,
+        "reasons": reasons
+    }
 
 
 # ============================================================
@@ -410,16 +398,33 @@ def main():
         print(f"❌ No images found in: {INPUT_DIR}")
         return
 
-    print("=== SMART ADAPTIVE EXTRACTION v18 (HMASK + BAND ANCHOR) ===")
+    print("=== SMART ADAPTIVE EXTRACTION v19 (GATED SNAP) ===")
     print(f"Input:  {INPUT_DIR}")
     print(f"Output: {OUTPUT_DIR}")
     print(f"Images found: {len(imgs)}")
+    print(f"STRONG_RULE_COV={STRONG_RULE_COV} MAX_ROW_SHIFT={MAX_ROW_SHIFT}")
+
+    faulty = []
+    stats = []
 
     for i, p in enumerate(imgs, start=1):
         print(f"\n[{i}/{len(imgs)}]")
-        process_one_image(p)
+        r = process_one_image(p)
+        if r is None:
+            continue
+        stats.append(r)
+        if r["unsafe_refused"] >= FAULTY_MIN_UNSAFE_ROWS:
+            faulty.append(r["name"])
+
+    # Write a clean list of the filenames to check
+    faulty_path = os.path.join(OUTPUT_DIR, "faulty_images.txt")
+    with open(faulty_path, "w", encoding="utf-8") as f:
+        for n in faulty:
+            f.write(n + "\n")
 
     print("\n🎯 DONE")
+    print(f"Faulty (to check) count = {len(faulty)}")
+    print(f"Wrote: {faulty_path}")
 
 if __name__ == "__main__":
     main()
