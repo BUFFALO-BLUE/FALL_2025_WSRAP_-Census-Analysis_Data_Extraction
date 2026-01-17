@@ -7,7 +7,32 @@ import numpy as np
 # ============================================================
 
 INPUT_DIR = "data/from_jeremy/images_aligned_to_first"
-OUTPUT_DIR = "data/processed/v30_deskew_vfix_hfix"
+OUTPUT_DIR = "data/processed/v29_hfix13_vfix_green"
+
+# If True, only process the known-bad horizontal images
+#isFocused
+FOCUS_ONLY_THESE = True
+FOCUS_NAMES = {
+    "m-t0627-00538-00680",
+    "m-t0627-00538-00682",
+    "m-t0627-00538-00694",
+    "m-t0627-00538-00696",
+    "m-t0627-00538-00700",
+    "m-t0627-00538-00708",
+    "m-t0627-00538-00714",
+    "m-t0627-00538-00725",
+    "m-t0627-00538-00729",
+    "m-t0627-00538-00730",
+    "m-t0627-00538-00735",
+    "m-t0627-00538-00736",
+    "m-t0627-00538-00737",
+}
+
+# Per-image horizontal shift (positive = move UP, negative = move DOWN)
+# You asked: 00737 move up ~7 px
+H_SPECIAL_SHIFT_BY_NAME = {
+    "m-t0627-00538-00737": 7,
+}
 
 NUM_ROWS = 40
 FIRST_ROW_Y_PRIOR = 1263
@@ -38,28 +63,7 @@ OFFSETS_FROM_ANCHOR = [
 ]
 
 # ============================================================
-# Manual per-image nudge (your request for 00680)
-# dx > 0 moves verticals RIGHT
-# dy > 0 moves horizontals UP (because we subtract dy)
-# ============================================================
-
-MANUAL_SHIFT = {
-    "m-t0627-00538-00680": {"dx": 20, "dy": 45},
-}
-
-# ============================================================
-# AUTO DESKEW (fix tilted scans like 00680/00682)
-# ============================================================
-
-AUTO_DESKEW = True
-
-# Hough settings for angle estimation from vertical mask
-DESKEW_MIN_LINES = 6
-DESKEW_MAX_ABS_DEG = 6.0     # ignore insane angles
-DESKEW_USE_MEDIAN = True     # robust
-
-# ============================================================
-# HORIZONTAL: bottom anchor + gated snapping
+# HORIZONTAL: bottom anchor + stronger gating (fixes the 13)
 # ============================================================
 
 HMASK_TRIALS = [
@@ -83,8 +87,11 @@ BOTTOM_PICK_MIN_COV = 0.12
 SNAP_SEARCH_BAND_Y = 18
 SNAP_ACCEPT_PX_Y = 8
 
+# Stronger gates
 H_GATE_STRONG_COV = 0.28
 H_GATE_MAX_SHIFT = 5
+
+# Relative-to-bottom gate
 H_REL_TO_BOTTOM = 0.55
 
 # ============================================================
@@ -151,23 +158,6 @@ def enhance_faint_rules(gray: np.ndarray):
     rr = cv2.normalize(blackhat, None, 0, 255, cv2.NORM_MINMAX)
     enhanced = cv2.addWeighted(g, 1.0, rr, float(BLACKHAT_MIX), 0)
     return enhanced, rr
-
-def rotate_image_keep_size(img: np.ndarray, angle_deg: float):
-    h, w = img.shape[:2]
-    center = (w * 0.5, h * 0.5)
-    M = cv2.getRotationMatrix2D(center, float(angle_deg), 1.0)
-    out = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    return out, M
-
-def apply_affine_to_points(M, pts_xy):
-    # pts_xy: Nx2 float32
-    pts = np.hstack([pts_xy.astype(np.float32), np.ones((len(pts_xy), 1), dtype=np.float32)])
-    out = (pts @ M.T)
-    return out[:, :2]
-
-def invert_affine(M):
-    Minv = cv2.invertAffineTransform(M)
-    return Minv
 
 
 # ============================================================
@@ -287,7 +277,7 @@ def gated_snap_y(y_expect: int, bands: list, bottom_cov: float):
 
 
 # ============================================================
-# Vertical: mask + coverage-gated snap + deskew angle estimate
+# Vertical: mask + coverage-gated snap
 # ============================================================
 
 def vertical_rule_mask(rr_table: np.ndarray) -> np.ndarray:
@@ -308,38 +298,6 @@ def vertical_rule_mask(rr_table: np.ndarray) -> np.ndarray:
         dk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 9))
         opened = cv2.dilate(opened, dk, iterations=int(VLINE_DILATE_ITERS))
     return opened
-
-def estimate_deskew_angle_from_vmask(vmask: np.ndarray) -> float:
-    """
-    Returns angle (deg) to rotate image so vertical lines become vertical.
-    Uses HoughLinesP on vmask edges.
-    """
-    edges = cv2.Canny(vmask, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold=120,
-                            minLineLength=max(80, int(0.35 * vmask.shape[0])),
-                            maxLineGap=20)
-    if lines is None or len(lines) < DESKEW_MIN_LINES:
-        return 0.0
-
-    angles = []
-    for x1, y1, x2, y2 in lines[:, 0]:
-        dx = float(x2 - x1)
-        dy = float(y2 - y1)
-        if abs(dy) < 1e-3:
-            continue
-        # angle of the segment relative to vertical (in degrees):
-        # perfect vertical -> 0
-        ang = np.degrees(np.arctan2(dx, dy))
-        # keep only near-vertical segments
-        if abs(ang) <= float(DESKEW_MAX_ABS_DEG):
-            angles.append(ang)
-
-    if len(angles) < DESKEW_MIN_LINES:
-        return 0.0
-
-    if DESKEW_USE_MEDIAN:
-        return float(np.median(angles))
-    return float(np.mean(angles))
 
 def detect_anchor_x_by_coverage(vmask: np.ndarray, x_prior_crop: int, search_band: int) -> int:
     h, w = vmask.shape
@@ -389,6 +347,7 @@ def best_x_by_vertical_coverage(vmask: np.ndarray, x_expected: int, band: int) -
 
 def microsnap_lines_by_coverage(lines_crop, vmask, band):
     out = [best_x_by_vertical_coverage(vmask, int(x), int(band)) for x in lines_crop]
+
     out2 = []
     last = -10**9
     for x in out:
@@ -412,7 +371,7 @@ def draw_overlay(gray, h_lines_y, v_lines_x, table_top, table_bottom, out_path):
         y = int(np.clip(y, 0, H - 1))
         cv2.line(viz, (0, y), (W, y), (0, 0, 255), 2)
 
-    # verticals = green
+    # verticals = GREEN (your request)
     for x in v_lines_x:
         x = int(np.clip(x, 0, W - 1))
         cv2.line(viz, (x, table_top), (x, table_bottom), (0, 255, 0), 2)
@@ -436,6 +395,9 @@ OFFSETS_CLEAN = clean_offsets(OFFSETS_FROM_ANCHOR)
 
 def process_one_image(img_path: str):
     name = os.path.splitext(os.path.basename(img_path))[0]
+    if FOCUS_ONLY_THESE and name not in FOCUS_NAMES:
+        return
+
     gray = read_gray(img_path)
     if gray is None:
         print(f"⚠️ Could not read: {img_path}")
@@ -445,100 +407,57 @@ def process_one_image(img_path: str):
     out_dir = os.path.join(OUTPUT_DIR, name)
     ensure_dir(out_dir)
 
-    # manual shifts
-    dx = int(MANUAL_SHIFT.get(name, {}).get("dx", 0))
-    dy = int(MANUAL_SHIFT.get(name, {}).get("dy", 0))
-
-    # Crop around expected table x-band
     xL = int(ANCHOR_X_PRIOR - X_MARGIN)
     xR = int(ANCHOR_X_PRIOR + TABLE_WIDTH_PRIOR + X_MARGIN)
     xL = max(0, min(W - 2, xL))
     xR = max(xL + 1, min(W - 1, xR))
 
-    # Crop around expected table y-band
     y0 = max(0, FIRST_ROW_Y_PRIOR - ROI_TOP_PAD)
     y1 = min(H, FIRST_ROW_Y_PRIOR + TABLE_HEIGHT_PX + ROI_BOTTOM_PAD)
 
+    # todo: can crop off too much, should test this or avoid hardcording a cropping amount
     crop = gray[y0:y1, xL:xR]
     _, rr_crop = enhance_faint_rules(crop)
 
-    # Horizontal bottom anchor bands (in crop coords but y0_full used)
     bands = build_bands_auto(rr_crop, y0_full=y0)
     table_bottom, bottom_cov = choose_bottom_anchor_with_strength(bands)
     table_top = int(table_bottom - TABLE_HEIGHT_PX)
 
-    # Build h-lines (flat in full coords)
     step_y = float(TABLE_HEIGHT_PX) / float(NUM_ROWS)
     h_lines = []
     for i in range(NUM_ROWS + 1):
         y_expect = int(round(table_top + i * step_y))
-        y_snap = int(gated_snap_y(y_expect, bands, bottom_cov))
-        h_lines.append(y_snap - dy)  # dy>0 moves UP
+        h_lines.append(int(gated_snap_y(y_expect, bands, bottom_cov)))
 
-    # Prepare table band for vertical detection
+    # apply per-image horizontal shift AFTER snapping
+    shift_up = int(H_SPECIAL_SHIFT_BY_NAME.get(name, 0))
+    if shift_up != 0:
+        h_lines = [int(y - shift_up) for y in h_lines]
+
     table_top_c = int(max(0, table_top - y0))
     table_bottom_c = int(min(rr_crop.shape[0] - 1, table_bottom - y0))
     rr_table = rr_crop[table_top_c + VDET_TOP_PAD : table_bottom_c - VDET_BOT_PAD, :]
 
-    # Deskew in table band only (keeps everything consistent for vertical fitting)
-    Mdeskew = None
-    angle = 0.0
+    vmask = vertical_rule_mask(rr_table)
 
-    vmask0 = vertical_rule_mask(rr_table)
-    if AUTO_DESKEW:
-        angle = estimate_deskew_angle_from_vmask(vmask0)
-        if abs(angle) > 0.2:
-            rr_table_rot, Mdeskew = rotate_image_keep_size(rr_table, -angle)
-            vmask = vertical_rule_mask(rr_table_rot)
-        else:
-            vmask = vmask0
-            Mdeskew = None
-    else:
-        vmask = vmask0
-
-    # Anchor prior in crop coords
     anchor_prior_crop = int(ANCHOR_X_PRIOR - xL)
-
-    # If deskewed, anchor_prior should be in rotated table coords.
-    # We approximate by keeping same x (rotation is small). Coverage search handles small mismatch.
     anchor_x_crop = detect_anchor_x_by_coverage(vmask, anchor_prior_crop, search_band=ANCHOR_SEARCH_BAND)
 
-    # Build vertical lines in "deskewed table coords"
     v_lines_crop = [anchor_x_crop] + [anchor_x_crop + o for o in OFFSETS_CLEAN]
 
     if ENABLE_VERTICAL_MICROSNAP:
         v_lines_crop = microsnap_lines_by_coverage(v_lines_crop, vmask, band=X_SNAP_BAND)
 
-    # Convert vertical lines back to full coords
-    # If deskew was used, map x positions back approximately (we only need overlay).
-    # We map a vertical line at x by sampling two y points and inverse-rotating them.
-    v_lines_full = []
+    v_lines_full = [int(xL + x) for x in v_lines_crop]
 
-    if Mdeskew is None:
-        for x in v_lines_crop:
-            v_lines_full.append(int(xL + x + dx))
-    else:
-        Minv = invert_affine(Mdeskew)
-        htab, wtab = rr_table.shape[:2]
-        yA = 5.0
-        yB = float(htab - 6)
-        for x in v_lines_crop:
-            pts = np.array([[float(x), yA], [float(x), yB]], dtype=np.float32)
-            pts_unrot = apply_affine_to_points(Minv, pts)
-            # take x from unrotated points (average)
-            x_unrot = float(np.mean(pts_unrot[:, 0]))
-            v_lines_full.append(int(xL + x_unrot + dx))
-
-    # Save only requested outputs
     if SAVE_RULE_RESPONSE_CROP:
         cv2.imwrite(os.path.join(out_dir, "debug_rule_response_crop.png"), rr_crop)
 
     if SAVE_OVERLAY:
-        draw_overlay(gray, h_lines, v_lines_full,
-                     int(table_top - dy), int(table_bottom - dy),
+        draw_overlay(gray, h_lines, v_lines_full, table_top, table_bottom,
                      os.path.join(out_dir, "grid_overlay.png"))
 
-    print(f"{name}: manual(dx={dx},dy={dy}) deskew_angle={angle:.3f}deg vlines={len(v_lines_full)}")
+    print(f"{name}: hshift_up={shift_up} bottom_cov={bottom_cov:.3f} vlines={len(v_lines_full)}")
 
 
 # ============================================================
@@ -552,15 +471,17 @@ def main():
         print(f"❌ No images found in: {INPUT_DIR}")
         return
 
-    print("=== v30 (deskew + manual shift + green verticals) ===")
+    print("=== v29 (green verticals + 00737 lift) ===")
     print(f"Images found: {len(imgs)}")
-    print(f"AUTO_DESKEW={AUTO_DESKEW}")
+    print(f"FOCUS_ONLY_THESE={FOCUS_ONLY_THESE} (set False to run all)")
     print(f"Offsets used: {len(OFFSETS_CLEAN)} (outliers removed)")
-    print(f"MANUAL_SHIFT keys: {list(MANUAL_SHIFT.keys())}")
+    print(f"H_GATE_STRONG_COV={H_GATE_STRONG_COV} H_REL_TO_BOTTOM={H_REL_TO_BOTTOM}")
+    print(f"VLINE_MIN_COVERAGE={VLINE_MIN_COVERAGE} X_SNAP_BAND={X_SNAP_BAND}")
 
     for i, p in enumerate(imgs, 1):
         base = os.path.splitext(os.path.basename(p))[0]
-        print(f"[{i}/{len(imgs)}] {base}")
+        if not FOCUS_ONLY_THESE or base in FOCUS_NAMES:
+            print(f"[{i}/{len(imgs)}] {base}")
         process_one_image(p)
 
     print("🎯 DONE")
