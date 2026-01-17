@@ -36,6 +36,7 @@ OFFSETS_FROM_ANCHOR = [
     2181,2259,2594,2675,2750,3040,3303,3568,3649,3795,3898,3998,4102,4202,
     4330,4380,4533,4682,5064,5445,5523,5647,5752,5805,5884,6032,6133,6214
 ]
+# NOTE: removed the obvious typo "43803" (was filtered anyway, but safer to delete)
 
 # ============================================================
 # Manual per-image nudge (your request for 00680)
@@ -105,12 +106,57 @@ VLINE_MIN_COVERAGE = 0.38
 COVERAGE_X_SMOOTH_RADIUS = 2
 
 # ============================================================
-# OUTPUTS ONLY
+# OUTPUTS (GRID)
 # ============================================================
 
 SAVE_OVERLAY = True
 SAVE_RULE_RESPONSE_CROP = True
 
+# ============================================================
+# DATASET EXTRACTION (HEAD ROWS)
+# ============================================================
+
+DATASET_DIR = "data/training/head_rows_v1"
+SAVE_ROW_IMG = True
+SAVE_CELL_IMGS = True
+SAVE_MASK_DEBUG = False  # set True if you want mask images for debugging
+
+# Trigger ONLY on these columns (must have ink in BOTH)
+TRIGGER_COLS = ["rented_or_owned", "house_number"]
+
+# Columns to save when trigger passes
+SAVE_COLS = ["street", "house_number", "rented_or_owned", "price", "gender", "race"]
+# Add "head" once you confirm its column number:
+# SAVE_COLS = ["street","house_number","rented_or_owned","price","gender","race","head"]
+
+# Column mapping by column INDEX (1-based) -> line indices (0-based)
+# Column k is between boundary line (k-1) and boundary line k.
+COLUMN_NUMBERS = {
+    "street": 1,
+    "house_number": 2,
+    "rented_or_owned": 4,
+    "price": 5,
+    "gender": 10,
+    "race": 11,
+    # "head": 9,   # <-- set this once you know it
+}
+
+def colnum_to_line_range(col_num: int):
+    return col_num - 1, col_num
+
+COLUMN_LINE_RANGES = {k: colnum_to_line_range(v) for k, v in COLUMN_NUMBERS.items()}
+
+# ============================================================
+# BORDER-SAFE INK DETECTION (NO OCR)
+# ============================================================
+
+CELL_PAD_X = 6
+CELL_PAD_Y = 4
+
+INNER_FRAC = 0.82       # analyze only inner region so borders don't trigger
+INK_BLOCK = 31          # adaptive threshold block size (odd)
+INK_C = 9               # higher -> fewer ink pixels
+INK_MIN_RATIO = 0.0016  # start here; tune if needed (0.0012..0.003)
 
 # ============================================================
 # Helpers
@@ -160,15 +206,125 @@ def rotate_image_keep_size(img: np.ndarray, angle_deg: float):
     return out, M
 
 def apply_affine_to_points(M, pts_xy):
-    # pts_xy: Nx2 float32
     pts = np.hstack([pts_xy.astype(np.float32), np.ones((len(pts_xy), 1), dtype=np.float32)])
     out = (pts @ M.T)
     return out[:, :2]
 
 def invert_affine(M):
-    Minv = cv2.invertAffineTransform(M)
-    return Minv
+    return cv2.invertAffineTransform(M)
 
+# ---------- Cell cropping + ink detection ----------
+
+def crop_cell(gray, x1, x2, y1, y2, pad_x=CELL_PAD_X, pad_y=CELL_PAD_Y):
+    H, W = gray.shape
+    x1 = int(max(0, min(W - 1, x1 + pad_x)))
+    x2 = int(max(0, min(W,     x2 - pad_x)))
+    y1 = int(max(0, min(H - 1, y1 + pad_y)))
+    y2 = int(max(0, min(H,     y2 - pad_y)))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return gray[y1:y2, x1:x2]
+
+def inner_crop(img, frac=INNER_FRAC):
+    if img is None:
+        return None
+    h, w = img.shape
+    fx = float(frac)
+    fy = float(frac)
+    dx = int((1.0 - fx) * w * 0.5)
+    dy = int((1.0 - fy) * h * 0.5)
+    x1, x2 = dx, w - dx
+    y1, y2 = dy, h - dy
+    if x2 <= x1 or y2 <= y1:
+        return img
+    return img[y1:y2, x1:x2]
+
+def binarize_for_ink(cell_gray):
+    if cell_gray is None:
+        return None
+    g = cv2.GaussianBlur(cell_gray, (3, 3), 0)
+    block = INK_BLOCK if INK_BLOCK % 2 == 1 else INK_BLOCK + 1
+    bw = cv2.adaptiveThreshold(
+        g, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,  # ink = white
+        block, INK_C
+    )
+    bw = cv2.erode(bw, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+    return bw
+
+def remove_straight_lines(bw):
+    if bw is None:
+        return None
+    h, w = bw.shape
+    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, w // 2), 1))
+    vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, h // 2)))
+    hlines = cv2.morphologyEx(bw, cv2.MORPH_OPEN, hk)
+    vlines = cv2.morphologyEx(bw, cv2.MORPH_OPEN, vk)
+    lines = cv2.bitwise_or(hlines, vlines)
+    cleaned = cv2.bitwise_and(bw, cv2.bitwise_not(lines))
+    return cleaned
+
+def ink_ratio(cell_gray):
+    inner = inner_crop(cell_gray)
+    bw = binarize_for_ink(inner)
+    bw2 = remove_straight_lines(bw)
+    if bw2 is None:
+        return 0.0, None
+    ink = float(np.count_nonzero(bw2))
+    total = float(bw2.size)
+    return (ink / max(1.0, total)), bw2
+
+# ---------- Column mapping validation + extraction ----------
+
+def validate_column_ranges(v_lines_full):
+    n = len(v_lines_full)
+    for key, (li, ri) in COLUMN_LINE_RANGES.items():
+        if li < 0 or ri >= n:
+            raise ValueError(f"Column '{key}' needs v_lines_full[{li},{ri}] but only have {n} lines.")
+
+def get_cell_from_grid(gray, v_lines_full, y1, y2, key):
+    li, ri = COLUMN_LINE_RANGES[key]
+    x1 = int(min(v_lines_full[li], v_lines_full[ri]))
+    x2 = int(max(v_lines_full[li], v_lines_full[ri]))
+    return crop_cell(gray, x1, x2, y1, y2)
+
+def row_trigger_pass(gray, v_lines_full, y1, y2):
+    ratios = {}
+    masks = {}
+    for k in TRIGGER_COLS:
+        cell = get_cell_from_grid(gray, v_lines_full, y1, y2, k)
+        r, m = ink_ratio(cell)
+        ratios[k] = float(r)
+        masks[k] = m
+    ok = all(ratios[k] >= float(INK_MIN_RATIO) for k in TRIGGER_COLS)
+    return ok, ratios, masks
+
+def save_row_package(gray, name, row_idx, y1, y2, v_lines_full, ratios, masks):
+    out_dir = os.path.join(DATASET_DIR, name, f"row_{row_idx:02d}")
+    ensure_dir(out_dir)
+
+    if SAVE_ROW_IMG:
+        row_crop = crop_cell(gray, 0, gray.shape[1], y1, y2, pad_x=0, pad_y=0)
+        if row_crop is not None:
+            cv2.imwrite(os.path.join(out_dir, "row.png"), row_crop)
+
+    if SAVE_CELL_IMGS:
+        for key in SAVE_COLS:
+            if key not in COLUMN_LINE_RANGES:
+                continue
+            cell = get_cell_from_grid(gray, v_lines_full, y1, y2, key)
+            if cell is not None:
+                cv2.imwrite(os.path.join(out_dir, f"{key}.png"), cell)
+
+    with open(os.path.join(out_dir, "meta.txt"), "w", encoding="utf-8") as f:
+        for k, v in ratios.items():
+            f.write(f"{k}_ink_ratio={v:.6f}\n")
+
+    if SAVE_MASK_DEBUG:
+        for k, m in masks.items():
+            if m is not None:
+                cv2.imwrite(os.path.join(out_dir, f"mask_{k}.png"), m)
 
 # ============================================================
 # Horizontal bands + bottom anchor
@@ -285,7 +441,6 @@ def gated_snap_y(y_expect: int, bands: list, bottom_cov: float):
 
     return int(cand["center_full"])
 
-
 # ============================================================
 # Vertical: mask + coverage-gated snap + deskew angle estimate
 # ============================================================
@@ -310,10 +465,6 @@ def vertical_rule_mask(rr_table: np.ndarray) -> np.ndarray:
     return opened
 
 def estimate_deskew_angle_from_vmask(vmask: np.ndarray) -> float:
-    """
-    Returns angle (deg) to rotate image so vertical lines become vertical.
-    Uses HoughLinesP on vmask edges.
-    """
     edges = cv2.Canny(vmask, 50, 150)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold=120,
                             minLineLength=max(80, int(0.35 * vmask.shape[0])),
@@ -327,10 +478,7 @@ def estimate_deskew_angle_from_vmask(vmask: np.ndarray) -> float:
         dy = float(y2 - y1)
         if abs(dy) < 1e-3:
             continue
-        # angle of the segment relative to vertical (in degrees):
-        # perfect vertical -> 0
-        ang = np.degrees(np.arctan2(dx, dy))
-        # keep only near-vertical segments
+        ang = np.degrees(np.arctan2(dx, dy))  # relative to vertical
         if abs(ang) <= float(DESKEW_MAX_ABS_DEG):
             angles.append(ang)
 
@@ -398,21 +546,18 @@ def microsnap_lines_by_coverage(lines_crop, vmask, band):
         last = x
     return out2
 
-
 # ============================================================
-# Overlay
+# Overlay with highlighted rectangles
 # ============================================================
 
-def draw_overlay(gray, h_lines_y, v_lines_x, table_top, table_bottom, out_path):
+def draw_overlay(gray, h_lines_y, v_lines_x, table_top, table_bottom, out_path, highlight_cols=True):
     viz = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     H, W = gray.shape
 
-    # horizontals = red
     for y in h_lines_y:
         y = int(np.clip(y, 0, H - 1))
         cv2.line(viz, (0, y), (W, y), (0, 0, 255), 2)
 
-    # verticals = green
     for x in v_lines_x:
         x = int(np.clip(x, 0, W - 1))
         cv2.line(viz, (x, table_top), (x, table_bottom), (0, 255, 0), 2)
@@ -420,9 +565,23 @@ def draw_overlay(gray, h_lines_y, v_lines_x, table_top, table_bottom, out_path):
     cv2.line(viz, (0, table_top), (W, table_top), (255, 255, 0), 2)
     cv2.line(viz, (0, table_bottom), (W, table_bottom), (0, 255, 255), 3)
 
+    if highlight_cols:
+        overlay = viz.copy()
+        for key in SAVE_COLS:
+            if key not in COLUMN_LINE_RANGES:
+                continue
+            li, ri = COLUMN_LINE_RANGES[key]
+            if 0 <= li < len(v_lines_x) and 0 <= ri < len(v_lines_x):
+                x1 = int(min(v_lines_x[li], v_lines_x[ri]))
+                x2 = int(max(v_lines_x[li], v_lines_x[ri]))
+                cv2.rectangle(overlay, (x1, table_top), (x2, table_bottom), (255, 0, 255), -1)
+                cv2.rectangle(viz, (x1, table_top), (x2, table_bottom), (255, 0, 255), 2)
+                cv2.putText(viz, key, (x1 + 6, table_top + 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2, cv2.LINE_AA)
+        viz = cv2.addWeighted(overlay, 0.18, viz, 0.82, 0)
+
     ensure_dir(os.path.dirname(out_path))
     cv2.imwrite(out_path, viz)
-
 
 # ============================================================
 # Main per-image
@@ -445,42 +604,35 @@ def process_one_image(img_path: str):
     out_dir = os.path.join(OUTPUT_DIR, name)
     ensure_dir(out_dir)
 
-    # manual shifts
     dx = int(MANUAL_SHIFT.get(name, {}).get("dx", 0))
     dy = int(MANUAL_SHIFT.get(name, {}).get("dy", 0))
 
-    # Crop around expected table x-band
     xL = int(ANCHOR_X_PRIOR - X_MARGIN)
     xR = int(ANCHOR_X_PRIOR + TABLE_WIDTH_PRIOR + X_MARGIN)
     xL = max(0, min(W - 2, xL))
     xR = max(xL + 1, min(W - 1, xR))
 
-    # Crop around expected table y-band
     y0 = max(0, FIRST_ROW_Y_PRIOR - ROI_TOP_PAD)
     y1 = min(H, FIRST_ROW_Y_PRIOR + TABLE_HEIGHT_PX + ROI_BOTTOM_PAD)
 
     crop = gray[y0:y1, xL:xR]
     _, rr_crop = enhance_faint_rules(crop)
 
-    # Horizontal bottom anchor bands (in crop coords but y0_full used)
     bands = build_bands_auto(rr_crop, y0_full=y0)
     table_bottom, bottom_cov = choose_bottom_anchor_with_strength(bands)
     table_top = int(table_bottom - TABLE_HEIGHT_PX)
 
-    # Build h-lines (flat in full coords)
     step_y = float(TABLE_HEIGHT_PX) / float(NUM_ROWS)
     h_lines = []
     for i in range(NUM_ROWS + 1):
         y_expect = int(round(table_top + i * step_y))
         y_snap = int(gated_snap_y(y_expect, bands, bottom_cov))
-        h_lines.append(y_snap - dy)  # dy>0 moves UP
+        h_lines.append(y_snap - dy)
 
-    # Prepare table band for vertical detection
     table_top_c = int(max(0, table_top - y0))
     table_bottom_c = int(min(rr_crop.shape[0] - 1, table_bottom - y0))
     rr_table = rr_crop[table_top_c + VDET_TOP_PAD : table_bottom_c - VDET_BOT_PAD, :]
 
-    # Deskew in table band only (keeps everything consistent for vertical fitting)
     Mdeskew = None
     angle = 0.0
 
@@ -496,24 +648,14 @@ def process_one_image(img_path: str):
     else:
         vmask = vmask0
 
-    # Anchor prior in crop coords
     anchor_prior_crop = int(ANCHOR_X_PRIOR - xL)
-
-    # If deskewed, anchor_prior should be in rotated table coords.
-    # We approximate by keeping same x (rotation is small). Coverage search handles small mismatch.
     anchor_x_crop = detect_anchor_x_by_coverage(vmask, anchor_prior_crop, search_band=ANCHOR_SEARCH_BAND)
 
-    # Build vertical lines in "deskewed table coords"
     v_lines_crop = [anchor_x_crop] + [anchor_x_crop + o for o in OFFSETS_CLEAN]
-
     if ENABLE_VERTICAL_MICROSNAP:
         v_lines_crop = microsnap_lines_by_coverage(v_lines_crop, vmask, band=X_SNAP_BAND)
 
-    # Convert vertical lines back to full coords
-    # If deskew was used, map x positions back approximately (we only need overlay).
-    # We map a vertical line at x by sampling two y points and inverse-rotating them.
     v_lines_full = []
-
     if Mdeskew is None:
         for x in v_lines_crop:
             v_lines_full.append(int(xL + x + dx))
@@ -525,21 +667,36 @@ def process_one_image(img_path: str):
         for x in v_lines_crop:
             pts = np.array([[float(x), yA], [float(x), yB]], dtype=np.float32)
             pts_unrot = apply_affine_to_points(Minv, pts)
-            # take x from unrotated points (average)
             x_unrot = float(np.mean(pts_unrot[:, 0]))
             v_lines_full.append(int(xL + x_unrot + dx))
 
-    # Save only requested outputs
+    # ===== NEW: head-row extraction by ink trigger =====
+    extracted = 0
+    try:
+        validate_column_ranges(v_lines_full)
+        ensure_dir(DATASET_DIR)
+        for r in range(len(h_lines) - 1):
+            y1r = int(min(h_lines[r], h_lines[r + 1]))
+            y2r = int(max(h_lines[r], h_lines[r + 1]))
+            ok, ratios, masks = row_trigger_pass(gray, v_lines_full, y1r, y2r)
+            if ok:
+                save_row_package(gray, name, r, y1r, y2r, v_lines_full, ratios, masks)
+                extracted += 1
+    except Exception as e:
+        print(f"⚠️ Extraction skipped for {name}: {e}")
+
     if SAVE_RULE_RESPONSE_CROP:
         cv2.imwrite(os.path.join(out_dir, "debug_rule_response_crop.png"), rr_crop)
 
     if SAVE_OVERLAY:
-        draw_overlay(gray, h_lines, v_lines_full,
-                     int(table_top - dy), int(table_bottom - dy),
-                     os.path.join(out_dir, "grid_overlay.png"))
+        draw_overlay(
+            gray, h_lines, v_lines_full,
+            int(table_top - dy), int(table_bottom - dy),
+            os.path.join(out_dir, "grid_overlay.png"),
+            highlight_cols=True
+        )
 
-    print(f"{name}: manual(dx={dx},dy={dy}) deskew_angle={angle:.3f}deg vlines={len(v_lines_full)}")
-
+    print(f"{name}: extracted={extracted} manual(dx={dx},dy={dy}) deskew_angle={angle:.3f}deg vlines={len(v_lines_full)}")
 
 # ============================================================
 # Main
@@ -552,11 +709,13 @@ def main():
         print(f"❌ No images found in: {INPUT_DIR}")
         return
 
-    print("=== v30 (deskew + manual shift + green verticals) ===")
+    print("=== v30 (deskew + extraction + highlighted columns) ===")
     print(f"Images found: {len(imgs)}")
     print(f"AUTO_DESKEW={AUTO_DESKEW}")
-    print(f"Offsets used: {len(OFFSETS_CLEAN)} (outliers removed)")
+    print(f"Offsets used: {len(OFFSETS_CLEAN)}")
     print(f"MANUAL_SHIFT keys: {list(MANUAL_SHIFT.keys())}")
+    print(f"DATASET_DIR={DATASET_DIR}")
+    print(f"TRIGGER_COLS={TRIGGER_COLS} INK_MIN_RATIO={INK_MIN_RATIO}")
 
     for i, p in enumerate(imgs, 1):
         base = os.path.splitext(os.path.basename(p))[0]
