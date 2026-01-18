@@ -36,10 +36,9 @@ OFFSETS_FROM_ANCHOR = [
     2181,2259,2594,2675,2750,3040,3303,3568,3649,3795,3898,3998,4102,4202,
     4330,4380,4533,4682,5064,5445,5523,5647,5752,5805,5884,6032,6133,6214
 ]
-# NOTE: removed the obvious typo "43803" (was filtered anyway, but safer to delete)
 
 # ============================================================
-# Manual per-image nudge (your request for 00680)
+# Manual per-image nudge
 # dx > 0 moves verticals RIGHT
 # dy > 0 moves horizontals UP (because we subtract dy)
 # ============================================================
@@ -49,15 +48,14 @@ MANUAL_SHIFT = {
 }
 
 # ============================================================
-# AUTO DESKEW (fix tilted scans like 00680/00682)
+# AUTO DESKEW
 # ============================================================
 
 AUTO_DESKEW = True
 
-# Hough settings for angle estimation from vertical mask
 DESKEW_MIN_LINES = 6
-DESKEW_MAX_ABS_DEG = 6.0     # ignore insane angles
-DESKEW_USE_MEDIAN = True     # robust
+DESKEW_MAX_ABS_DEG = 6.0
+DESKEW_USE_MEDIAN = True
 
 # ============================================================
 # HORIZONTAL: bottom anchor + gated snapping
@@ -119,18 +117,15 @@ SAVE_RULE_RESPONSE_CROP = True
 DATASET_DIR = "data/training/head_rows_v1"
 SAVE_ROW_IMG = True
 SAVE_CELL_IMGS = True
-SAVE_MASK_DEBUG = False  # set True if you want mask images for debugging
+SAVE_MASK_DEBUG = False  # set True to save mask images per trigger cell
 
 # Trigger ONLY on these columns (must have ink in BOTH)
 TRIGGER_COLS = ["rented_or_owned", "house_number"]
 
 # Columns to save when trigger passes
 SAVE_COLS = ["street", "house_number", "rented_or_owned", "price", "gender", "race"]
-# Add "head" once you confirm its column number:
-# SAVE_COLS = ["street","house_number","rented_or_owned","price","gender","race","head"]
 
 # Column mapping by column INDEX (1-based) -> line indices (0-based)
-# Column k is between boundary line (k-1) and boundary line k.
 COLUMN_NUMBERS = {
     "street": 2,
     "house_number": 3,
@@ -138,7 +133,7 @@ COLUMN_NUMBERS = {
     "price": 6,
     "gender": 11,
     "race": 12,
-    "head": 9,   
+    "head": 9,
 }
 
 def colnum_to_line_range(col_num: int):
@@ -153,10 +148,18 @@ COLUMN_LINE_RANGES = {k: colnum_to_line_range(v) for k, v in COLUMN_NUMBERS.item
 CELL_PAD_X = 6
 CELL_PAD_Y = 4
 
-INNER_FRAC = 0.82       # analyze only inner region so borders don't trigger
+# IMPORTANT: smaller inner crop ignores more border
+INNER_FRAC = 0.70
+
 INK_BLOCK = 31          # adaptive threshold block size (odd)
-INK_C = 9               # higher -> fewer ink pixels
-INK_MIN_RATIO = 0.03  # start here; tune if needed (0.0012..0.003)
+INK_C = 11              # higher -> fewer ink pixels
+INK_MIN_RATIO = 0.021   # tune as needed
+
+# --- NEW: anti-speck / anti-border / anti-line-fragment settings ---
+BORDER_KILL_PX = 6      # kill pixels near the inner-crop border
+CC_MIN_AREA = 30        # drop tiny connected components (specks)
+LINE_AR = 12.0          # aspect ratio threshold to treat as "line-like"
+LINE_THICK = 3          # max thickness of a line-like fragment
 
 # ============================================================
 # Helpers
@@ -213,7 +216,9 @@ def apply_affine_to_points(M, pts_xy):
 def invert_affine(M):
     return cv2.invertAffineTransform(M)
 
-# ---------- Cell cropping + ink detection ----------
+# ============================================================
+# Cell cropping + ink detection
+# ============================================================
 
 def crop_cell(gray, x1, x2, y1, y2, pad_x=CELL_PAD_X, pad_y=CELL_PAD_Y):
     H, W = gray.shape
@@ -265,17 +270,89 @@ def remove_straight_lines(bw):
     cleaned = cv2.bitwise_and(bw, cv2.bitwise_not(lines))
     return cleaned
 
+def drop_small_components(bw, min_area=25):
+    """
+    bw: uint8 mask, ink=255
+    Removes connected components smaller than min_area.
+    """
+    if bw is None:
+        return None
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((bw > 0).astype(np.uint8), connectivity=8)
+    if num <= 1:
+        return bw
+
+    out = np.zeros_like(bw)
+    for i in range(1, num):  # skip background
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area >= int(min_area):
+            out[labels == i] = 255
+    return out
+
+def kill_border_pixels(bw, margin=BORDER_KILL_PX):
+    """Zero out a margin around the mask to ignore border fragments."""
+    if bw is None:
+        return None
+    m = int(max(0, margin))
+    if m <= 0:
+        return bw
+    out = bw.copy()
+    out[:m, :] = 0
+    out[-m:, :] = 0
+    out[:, :m] = 0
+    out[:, -m:] = 0
+    return out
+
+def remove_line_like_components(bw, ar=LINE_AR, thick=LINE_THICK):
+    """
+    Remove components that look like thin long lines (rule fragments).
+    """
+    if bw is None:
+        return None
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((bw > 0).astype(np.uint8), connectivity=8)
+    if num <= 1:
+        return bw
+
+    out = np.zeros_like(bw)
+    for i in range(1, num):
+        x, y, w, h, area = stats[i]
+        w = int(w); h = int(h); area = int(area)
+        if area <= 0:
+            continue
+
+        # classify as line-like
+        if (w >= int(ar * max(1, h)) and h <= int(thick)) or (h >= int(ar * max(1, w)) and w <= int(thick)):
+            continue
+
+        out[labels == i] = 255
+    return out
+
 def ink_ratio(cell_gray):
+    """
+    Returns (ratio, mask) where mask is aggressively cleaned:
+    - inner crop ignores outer border
+    - adaptive threshold
+    - remove straight line artifacts
+    - kill border pixels inside the inner crop (prevents border leaks)
+    - drop small components (specks)
+    - remove line-like fragments
+    """
     inner = inner_crop(cell_gray)
     bw = binarize_for_ink(inner)
     bw2 = remove_straight_lines(bw)
-    if bw2 is None:
+    bw2 = kill_border_pixels(bw2, margin=BORDER_KILL_PX)
+    bw2 = drop_small_components(bw2, min_area=CC_MIN_AREA)
+    bw2 = remove_line_like_components(bw2, ar=LINE_AR, thick=LINE_THICK)
+
+    if bw2 is None or bw2.size == 0:
         return 0.0, None
+
     ink = float(np.count_nonzero(bw2))
     total = float(bw2.size)
     return (ink / max(1.0, total)), bw2
 
-# ---------- Column mapping validation + extraction ----------
+# ============================================================
+# Column mapping validation + extraction
+# ============================================================
 
 def validate_column_ranges(v_lines_full):
     n = len(v_lines_full)
@@ -466,9 +543,11 @@ def vertical_rule_mask(rr_table: np.ndarray) -> np.ndarray:
 
 def estimate_deskew_angle_from_vmask(vmask: np.ndarray) -> float:
     edges = cv2.Canny(vmask, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold=120,
-                            minLineLength=max(80, int(0.35 * vmask.shape[0])),
-                            maxLineGap=20)
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180.0, threshold=120,
+        minLineLength=max(80, int(0.35 * vmask.shape[0])),
+        maxLineGap=20
+    )
     if lines is None or len(lines) < DESKEW_MIN_LINES:
         return 0.0
 
@@ -485,9 +564,7 @@ def estimate_deskew_angle_from_vmask(vmask: np.ndarray) -> float:
     if len(angles) < DESKEW_MIN_LINES:
         return 0.0
 
-    if DESKEW_USE_MEDIAN:
-        return float(np.median(angles))
-    return float(np.mean(angles))
+    return float(np.median(angles)) if DESKEW_USE_MEDIAN else float(np.mean(angles))
 
 def detect_anchor_x_by_coverage(vmask: np.ndarray, x_prior_crop: int, search_band: int) -> int:
     h, w = vmask.shape
@@ -547,7 +624,7 @@ def microsnap_lines_by_coverage(lines_crop, vmask, band):
     return out2
 
 # ============================================================
-# Overlay with highlighted rectangles
+# Overlay
 # ============================================================
 
 def draw_overlay(gray, h_lines_y, v_lines_x, table_top, table_bottom, out_path, highlight_cols=True):
@@ -597,7 +674,7 @@ def process_one_image(img_path: str):
     name = os.path.splitext(os.path.basename(img_path))[0]
     gray = read_gray(img_path)
     if gray is None:
-        print(f"⚠️ Could not read: {img_path}")
+        print(f"⚠️ Could not read: {img_path}", flush=True)
         return
 
     H, W = gray.shape
@@ -661,7 +738,7 @@ def process_one_image(img_path: str):
             v_lines_full.append(int(xL + x + dx))
     else:
         Minv = invert_affine(Mdeskew)
-        htab, wtab = rr_table.shape[:2]
+        htab, _ = rr_table.shape[:2]
         yA = 5.0
         yB = float(htab - 6)
         for x in v_lines_crop:
@@ -670,20 +747,23 @@ def process_one_image(img_path: str):
             x_unrot = float(np.mean(pts_unrot[:, 0]))
             v_lines_full.append(int(xL + x_unrot + dx))
 
-    # ===== NEW: head-row extraction by ink trigger =====
+    # ===== head-row extraction by cleaned ink trigger =====
     extracted = 0
     try:
         validate_column_ranges(v_lines_full)
         ensure_dir(DATASET_DIR)
+
         for r in range(len(h_lines) - 1):
             y1r = int(min(h_lines[r], h_lines[r + 1]))
             y2r = int(max(h_lines[r], h_lines[r + 1]))
+
             ok, ratios, masks = row_trigger_pass(gray, v_lines_full, y1r, y2r)
             if ok:
                 save_row_package(gray, name, r, y1r, y2r, v_lines_full, ratios, masks)
                 extracted += 1
+
     except Exception as e:
-        print(f"⚠️ Extraction skipped for {name}: {e}")
+        print(f"⚠️ Extraction skipped for {name}: {e}", flush=True)
 
     if SAVE_RULE_RESPONSE_CROP:
         cv2.imwrite(os.path.join(out_dir, "debug_rule_response_crop.png"), rr_crop)
@@ -696,7 +776,11 @@ def process_one_image(img_path: str):
             highlight_cols=True
         )
 
-    print(f"{name}: extracted={extracted} manual(dx={dx},dy={dy}) deskew_angle={angle:.3f}deg vlines={len(v_lines_full)}")
+    print(
+        f"{name}: extracted={extracted} manual(dx={dx},dy={dy}) "
+        f"deskew_angle={angle:.3f}deg vlines={len(v_lines_full)}",
+        flush=True
+    )
 
 # ============================================================
 # Main
@@ -706,23 +790,24 @@ def main():
     ensure_dir(OUTPUT_DIR)
     imgs = list_images(INPUT_DIR)
     if not imgs:
-        print(f"❌ No images found in: {INPUT_DIR}")
+        print(f"❌ No images found in: {INPUT_DIR}", flush=True)
         return
 
-    print("=== v30 (deskew + extraction + highlighted columns) ===")
-    print(f"Images found: {len(imgs)}")
-    print(f"AUTO_DESKEW={AUTO_DESKEW}")
-    print(f"Offsets used: {len(OFFSETS_CLEAN)}")
-    print(f"MANUAL_SHIFT keys: {list(MANUAL_SHIFT.keys())}")
-    print(f"DATASET_DIR={DATASET_DIR}")
-    print(f"TRIGGER_COLS={TRIGGER_COLS} INK_MIN_RATIO={INK_MIN_RATIO}")
+    print("=== v30 (deskew + vertical microsnap + border-safe ink trigger) ===", flush=True)
+    print(f"Images found: {len(imgs)}", flush=True)
+    print(f"AUTO_DESKEW={AUTO_DESKEW}", flush=True)
+    print(f"Offsets used: {len(OFFSETS_CLEAN)}", flush=True)
+    print(f"MANUAL_SHIFT keys: {list(MANUAL_SHIFT.keys())}", flush=True)
+    print(f"DATASET_DIR={DATASET_DIR}", flush=True)
+    print(f"TRIGGER_COLS={TRIGGER_COLS} INK_MIN_RATIO={INK_MIN_RATIO}", flush=True)
+    print(f"INNER_FRAC={INNER_FRAC} BORDER_KILL_PX={BORDER_KILL_PX} CC_MIN_AREA={CC_MIN_AREA} LINE_AR={LINE_AR} LINE_THICK={LINE_THICK}", flush=True)
 
     for i, p in enumerate(imgs, 1):
         base = os.path.splitext(os.path.basename(p))[0]
-        print(f"[{i}/{len(imgs)}] {base}")
+        print(f"[{i}/{len(imgs)}] {base}", flush=True)
         process_one_image(p)
 
-    print("🎯 DONE")
+    print("🎯 DONE", flush=True)
 
 if __name__ == "__main__":
     main()
