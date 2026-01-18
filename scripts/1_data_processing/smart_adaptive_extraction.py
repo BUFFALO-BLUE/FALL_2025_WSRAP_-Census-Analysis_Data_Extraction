@@ -32,7 +32,7 @@ BLACKHAT_MIX = 0.85
 
 # Offsets from anchor (cleaned)
 OFFSETS_FROM_ANCHOR = [
-    83,161,290,365,444,522,592,670,1331,1600,1650,1733,1835,1920,2025,2104,
+    83,161,290,365,444,592,670,1331,1600,1650,1733,1835,1920,2025,2104,
     2181,2259,2594,2675,2750,3040,3303,3568,3649,3795,3898,3998,4102,4202,
     4330,4380,4533,4682,5064,5445,5523,5647,5752,5805,5884,6032,6133,6214
 ]
@@ -132,13 +132,13 @@ SAVE_COLS = ["street", "house_number", "rented_or_owned", "price", "gender", "ra
 # Column mapping by column INDEX (1-based) -> line indices (0-based)
 # Column k is between boundary line (k-1) and boundary line k.
 COLUMN_NUMBERS = {
-    "street": 1,
-    "house_number": 2,
-    "rented_or_owned": 4,
-    "price": 5,
-    "gender": 10,
-    "race": 11,
-    # "head": 9,   # <-- set this once you know it
+    "street": 2,
+    "house_number": 3,
+    "rented_or_owned": 5,
+    "price": 6,
+    "gender": 11,
+    "race": 12,
+    "head": 9,   
 }
 
 def colnum_to_line_range(col_num: int):
@@ -156,7 +156,7 @@ CELL_PAD_Y = 4
 INNER_FRAC = 0.82       # analyze only inner region so borders don't trigger
 INK_BLOCK = 31          # adaptive threshold block size (odd)
 INK_C = 9               # higher -> fewer ink pixels
-INK_MIN_RATIO = 0.0016  # start here; tune if needed (0.0012..0.003)
+INK_MIN_RATIO = 0.03  # start here; tune if needed (0.0012..0.003)
 
 # ============================================================
 # Helpers
