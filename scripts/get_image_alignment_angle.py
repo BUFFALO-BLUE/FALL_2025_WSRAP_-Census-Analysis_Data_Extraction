@@ -71,7 +71,7 @@ def batch_align_to_first():
     """
     Align ALL images to the first image (m-t0627-00538-00634.jpg)
     """
-    input_dir = Path("data/from_jeremy/images")
+    input_dir = Path("data/Research Final Ver. Jeremy P")
     output_dir = Path("data/from_jeremy/images_aligned_to_first")
     output_dir.mkdir(parents=True, exist_ok=True)
     

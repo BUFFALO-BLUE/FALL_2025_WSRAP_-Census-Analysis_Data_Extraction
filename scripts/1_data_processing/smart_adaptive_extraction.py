@@ -1,4 +1,5 @@
 import os
+import json
 import cv2
 import numpy as np
 
@@ -6,7 +7,7 @@ import numpy as np
 # CONFIG
 # ============================================================
 
-INPUT_DIR = "data/from_jeremy/images_aligned_to_first"
+INPUT_DIR = "data/from_jeremy/Aligned_Test"
 OUTPUT_DIR = "data/processed/v30_deskew_vfix_hfix"
 
 NUM_ROWS = 40
@@ -114,7 +115,7 @@ SAVE_RULE_RESPONSE_CROP = True
 # DATASET EXTRACTION (HEAD ROWS)
 # ============================================================
 
-DATASET_DIR = "data/training/head_rows_v1"
+DATASET_DIR = "data/training/head_rows_AzureTest"
 SAVE_ROW_IMG = True
 SAVE_CELL_IMGS = True
 SAVE_MASK_DEBUG = False  # set True to save mask images per trigger cell
@@ -402,6 +403,44 @@ def save_row_package(gray, name, row_idx, y1, y2, v_lines_full, ratios, masks):
         for k, m in masks.items():
             if m is not None:
                 cv2.imwrite(os.path.join(out_dir, f"mask_{k}.png"), m)
+
+# ============================================================
+# NEW: Save street strip + rows.json (NO OCR)
+# ============================================================
+
+def save_street_strip_and_rows(gray, name, v_lines_full, h_lines):
+    page_dir = os.path.join(DATASET_DIR, name)
+    ensure_dir(page_dir)
+
+    # --- crop full street column strip ---
+    y_top = int(min(h_lines[0], h_lines[-1]))
+    y_bot = int(max(h_lines[0], h_lines[-1]))
+
+    strip = get_cell_from_grid(
+        gray,
+        v_lines_full,
+        y_top,
+        y_bot,
+        key="street"
+    )
+
+    if strip is not None:
+        cv2.imwrite(os.path.join(page_dir, "street_strip.png"), strip)
+
+    # --- save row boundaries ---
+    rows_meta = []
+    for r in range(len(h_lines) - 1):
+        y1 = int(min(h_lines[r], h_lines[r + 1]))
+        y2 = int(max(h_lines[r], h_lines[r + 1]))
+        rows_meta.append({
+            "row_idx": r,
+            "y1": y1,
+            "y2": y2,
+            "y_center": (y1 + y2) / 2.0
+        })
+
+    with open(os.path.join(page_dir, "rows.json"), "w", encoding="utf-8") as f:
+        json.dump(rows_meta, f, indent=2)
 
 # ============================================================
 # Horizontal bands + bottom anchor
@@ -746,6 +785,9 @@ def process_one_image(img_path: str):
             pts_unrot = apply_affine_to_points(Minv, pts)
             x_unrot = float(np.mean(pts_unrot[:, 0]))
             v_lines_full.append(int(xL + x_unrot + dx))
+
+    # Save street strip + row boundaries (NO OCR)
+    save_street_strip_and_rows(gray, name, v_lines_full, h_lines)
 
     # ===== head-row extraction by cleaned ink trigger =====
     extracted = 0
