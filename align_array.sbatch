@@ -23,7 +23,7 @@ mkdir -p "$CODE_DIR" "$DATA_RAW" "$DATA_ALIGNED" "$OUTPUTS" "$LOGS"
 INPUT_LIST="$CODE_DIR/jpg_list.txt"
 
 if [[ ! -f "$INPUT_LIST" ]]; then
-  echo "❌ Missing file list at $INPUT_LIST" >&2
+  echo "Missing file list at $INPUT_LIST" >&2
   echo "Create it first:" >&2
   echo "  find \"$DATA_RAW/Research Final ver. Jeremy P\" -type f -name \"*.jpg\" | sort > \"$INPUT_LIST\"" >&2
   exit 1
@@ -33,7 +33,7 @@ REF_IMAGE="${REF_IMAGE:-$(head -n 1 "$INPUT_LIST")}"
 IMAGE_PATH=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$INPUT_LIST")
 
 if [[ -z "$IMAGE_PATH" ]]; then
-  echo "❌ No image found for task ID ${SLURM_ARRAY_TASK_ID}" >&2
+  echo "No image found for task ID ${SLURM_ARRAY_TASK_ID}" >&2
   exit 1
 fi
 
