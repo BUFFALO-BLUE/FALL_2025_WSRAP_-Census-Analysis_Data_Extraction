@@ -713,7 +713,7 @@ def process_one_image(img_path: str):
     name = os.path.splitext(os.path.basename(img_path))[0]
     gray = read_gray(img_path)
     if gray is None:
-        print(f"⚠️ Could not read: {img_path}", flush=True)
+        print(f" Could not read: {img_path}", flush=True)
         return
 
     H, W = gray.shape
@@ -805,7 +805,7 @@ def process_one_image(img_path: str):
                 extracted += 1
 
     except Exception as e:
-        print(f"⚠️ Extraction skipped for {name}: {e}", flush=True)
+        print(f" Extraction skipped for {name}: {e}", flush=True)
 
     if SAVE_RULE_RESPONSE_CROP:
         cv2.imwrite(os.path.join(out_dir, "debug_rule_response_crop.png"), rr_crop)
@@ -832,7 +832,7 @@ def main():
     ensure_dir(OUTPUT_DIR)
     imgs = list_images(INPUT_DIR)
     if not imgs:
-        print(f"❌ No images found in: {INPUT_DIR}", flush=True)
+        print(f" No images found in: {INPUT_DIR}", flush=True)
         return
 
     print("=== v30 (deskew + vertical microsnap + border-safe ink trigger) ===", flush=True)
@@ -849,7 +849,7 @@ def main():
         print(f"[{i}/{len(imgs)}] {base}", flush=True)
         process_one_image(p)
 
-    print("🎯 DONE", flush=True)
+    print(" DONE", flush=True)
 
 if __name__ == "__main__":
     main()

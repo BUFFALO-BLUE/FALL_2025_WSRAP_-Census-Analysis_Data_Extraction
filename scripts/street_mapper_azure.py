@@ -233,15 +233,15 @@ def main():
 
         rows_meta = load_rows(rows_path)
 
-        # ✅ Heartbeat: tell us exactly where we're waiting
-        print("   ⏳ sending to Azure...", flush=True)
+        #  Heartbeat: tell us exactly where we're waiting
+        print("   sending to Azure...", flush=True)
         lines = azure_ocr_lines_with_ycenters(strip_path, client)
-        print("   ✅ Azure returned (writing debug + mapping rows)...", flush=True)
+        print("    Azure returned (writing debug + mapping rows)...", flush=True)
 
         debug_path = page / "street_azure_lines.json"
         with open(debug_path, "w", encoding="utf-8") as f:
             json.dump([{"text": t, "y_center": y} for t, y in lines], f, indent=2)
-        print(f"🧾 returned {len(lines)} lines → {debug_path}", flush=True)
+        print(f" returned {len(lines)} lines → {debug_path}", flush=True)
 
         allowed_rows = get_extracted_row_indices(page)
         street_map = assign_lines_to_rows(lines, rows_meta, allowed_rows)
@@ -249,12 +249,12 @@ def main():
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(street_map, f, indent=2, ensure_ascii=False)
 
-        print(f"  ✅ wrote {out_path.name} ({len(street_map)} rows)", flush=True)
+        print(f"  wrote {out_path.name} ({len(street_map)} rows)", flush=True)
 
-        # ✅ Gentle throttle to reduce random stalls / rate-limits
+        # Gentle throttle to reduce random stalls / rate-limits
         time.sleep(0.5)
 
-    print("🎯 DONE", flush=True)
+    print(" DONE", flush=True)
 
 
 

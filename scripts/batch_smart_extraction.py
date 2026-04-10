@@ -36,7 +36,7 @@ def batch_smart_extraction(use_aligned=True, use_ready=False):
     
     # Check if directory exists
     if not os.path.exists(image_dir):
-        print(f"❌ Directory not found: {image_dir}")
+        print(f"Directory not found: {image_dir}")
         print("Please run alignment first or check the folder structure.")
         return 0, 0
     
@@ -44,7 +44,7 @@ def batch_smart_extraction(use_aligned=True, use_ready=False):
     image_paths = glob.glob(f'{image_dir}/*.jpg')
     
     if not image_paths:
-        print(f"❌ No images found in {image_dir}")
+        print(f" No images found in {image_dir}")
         return 0, 0
     
     print(f"Found {len(image_paths)} census images in {image_dir}")
@@ -62,7 +62,7 @@ def batch_smart_extraction(use_aligned=True, use_ready=False):
             # Load and preprocess
             image = cv2.imread(image_path, 0)  # Read as grayscale
             if image is None:
-                print(f"❌ Could not load {image_path}")
+                print(f" Could not load {image_path}")
                 failed_images.append(os.path.basename(image_path))
                 continue
             
@@ -79,20 +79,20 @@ def batch_smart_extraction(use_aligned=True, use_ready=False):
             total_cells += cells_extracted
             processed_images.append(os.path.basename(image_path))
             
-            print(f"✅ {head_rows} head rows, {cells_extracted} cells extracted")
+            print(f" {head_rows} head rows, {cells_extracted} cells extracted")
             
         except Exception as e:
-            print(f"❌ Error processing {image_path}: {e}")
+            print(f" Error processing {image_path}: {e}")
             import traceback
             traceback.print_exc()
             failed_images.append(os.path.basename(image_path))
     
     print(f"\n{'='*60}")
-    print("🎉 BATCH PROCESSING COMPLETE!")
+    print(" BATCH PROCESSING COMPLETE!")
     print(f"{'='*60}")
     
     # Summary
-    print(f"\n📊 PROCESSING SUMMARY:")
+    print(f"\n PROCESSING SUMMARY:")
     print(f"Input folder: {image_dir}")
     print(f"Images processed successfully: {len(processed_images)}")
     print(f"Images failed: {len(failed_images)}")
@@ -100,7 +100,7 @@ def batch_smart_extraction(use_aligned=True, use_ready=False):
     print(f"Total cells extracted: {total_cells}")
     
     if failed_images:
-        print(f"\n❌ Failed images:")
+        print(f"\n Failed images:")
         for img in failed_images:
             print(f"  - {img}")
     
@@ -130,9 +130,9 @@ def batch_smart_extraction(use_aligned=True, use_ready=False):
             for img in failed_images:
                 f.write(f"{img}\n")
     
-    print(f"\n📁 Output organized by image in: data/extracted_cells_{output_suffix}/")
-    print(f"📝 Processing log saved to: {log_file}")
-    print(f"🔧 Next step: Run Excel mapping script")
+    print(f"\n Output organized by image in: data/extracted_cells_{output_suffix}/")
+    print(f" Processing log saved to: {log_file}")
+    print(f" Next step: Run Excel mapping script")
     
     return total_head_rows, total_cells
 
