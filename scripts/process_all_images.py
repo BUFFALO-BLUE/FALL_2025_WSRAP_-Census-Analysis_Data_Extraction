@@ -29,14 +29,14 @@ def process_all_census_images():
             
             if cells_extracted > 0:
                 successful += 1
-                print(f"  ✅ Success: {cells_extracted} cells")
+                print(f"   Success: {cells_extracted} cells")
             else:
-                print(f"  ❌ Failed to extract cells")
+                print(f"  Failed to extract cells")
                 
         except Exception as e:
-            print(f"  ❌ Error: {e}")
+            print(f" Error: {e}")
     
-    print(f"\n🎉 BATCH PROCESSING COMPLETE!")
+    print(f"\n BATCH PROCESSING COMPLETE!")
     print(f"Successfully processed {successful}/{len(image_paths)} images")
     print(f"Extracted data saved to: data/extracted_data/")
 

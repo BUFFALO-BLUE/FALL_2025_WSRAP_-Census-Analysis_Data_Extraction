@@ -79,19 +79,19 @@ def batch_align_to_first():
     all_images = sorted(list(input_dir.glob("*.jpg")))
     
     if not all_images:
-        print("❌ No images found!")
+        print(" No images found!")
         return
     
     # Reference image (first one, should be straight)
     reference_path = all_images[0]
-    print(f"🎯 REFERENCE IMAGE: {reference_path.name}")
+    print(f" REFERENCE IMAGE: {reference_path.name}")
     
     # Get reference alignment
     ref_angle, _ = get_image_alignment_angle(reference_path)
     print(f"   Reference angle: {ref_angle:.2f}° (should be close to 0)")
     
     # Process all images
-    print(f"\n🔄 Aligning {len(all_images)} images to reference...")
+    print(f"\n Aligning {len(all_images)} images to reference...")
     print("="*60)
     
     rotation_stats = []
@@ -102,14 +102,14 @@ def batch_align_to_first():
         # Load image
         img = cv2.imread(str(img_path))
         if img is None:
-            print(f"  ❌ Could not load, skipping")
+            print(f"  Could not load, skipping")
             continue
         
         if img_path == reference_path:
             # Copy reference as-is
             cv2.imwrite(str(output_dir / img_path.name), img)
             rotation_stats.append((img_path.name, 0.0, 0.0, ref_angle))
-            print(f"  ✓ Reference image, copied as-is")
+            print(f"  Reference image, copied as-is")
             continue
         
         # Calculate alignment correction
@@ -117,7 +117,7 @@ def batch_align_to_first():
         
         # Apply correction if significant
         if abs(correction_needed) > 0.3:
-            print(f"  📐 Raw: {raw_angle:.2f}°, Correction: {correction_needed:.2f}°")
+            print(f"  Raw: {raw_angle:.2f}°, Correction: {correction_needed:.2f}°")
             
             # Rotate image
             height, width = img.shape[:2]
@@ -183,7 +183,7 @@ def batch_align_to_first():
     
     # Print summary
     print(f"\n" + "="*60)
-    print("📊 ALIGNMENT SUMMARY")
+    print(" ALIGNMENT SUMMARY")
     print("="*60)
     
     rotated_count = sum(1 for _, _, correction, _ in rotation_stats if abs(correction) > 0.1)
@@ -194,7 +194,7 @@ def batch_align_to_first():
     print(f"Images already aligned: {len(rotation_stats) - rotated_count}")
     
     # Show problematic images (large corrections)
-    print(f"\n⚠️  LARGEST CORRECTIONS:")
+    print(f"\n LARGEST CORRECTIONS:")
     rotation_stats.sort(key=lambda x: abs(x[2]), reverse=True)
     
     for name, raw, correction, _ in rotation_stats[:10]:
@@ -217,7 +217,7 @@ def batch_align_to_first():
         for name, raw, correction, _ in rotation_stats:
             f.write(f"{name}, {raw:.2f}, {correction:.2f}\n")
     
-    print(f"\n✅ Alignment complete!")
+    print(f"\n Alignment complete!")
     print(f"   Aligned images: {output_dir}")
     print(f"   Debug comparisons: {output_dir}/debug_comparisons/")
     print(f"   Log file: {log_path}")
@@ -231,13 +231,13 @@ def verify_extraction_on_aligned():
     aligned_dir = Path("data/from_jeremy/images_aligned_to_first")
     
     if not aligned_dir.exists():
-        print("❌ Aligned images not found! Run alignment first.")
+        print(" Aligned images not found! Run alignment first.")
         return
     
     # Pick first few images
     test_images = sorted(list(aligned_dir.glob("*.jpg")))[:3]
     
-    print("🧪 VERIFYING EXTRACTION ON ALIGNED IMAGES")
+    print(" VERIFYING EXTRACTION ON ALIGNED IMAGES")
     print("="*60)
     
     for img_path in test_images:
@@ -287,7 +287,7 @@ def verify_extraction_on_aligned():
 
 if __name__ == "__main__":
     print("="*70)
-    print("🔥 ALIGN ALL IMAGES TO FIRST (STRAIGHT) IMAGE")
+    print("ALIGN ALL IMAGES TO FIRST (STRAIGHT) IMAGE")
     print("="*70)
     
     print("\nThis will:")
@@ -301,13 +301,13 @@ if __name__ == "__main__":
     if confirm in ['yes', 'y']:
         output_dir = batch_align_to_first()
         
-        print(f"\n🎯 NEXT STEPS:")
+        print(f"\n NEXT STEPS:")
         print(f"1. Check debug comparisons: {output_dir}/debug_comparisons/")
         print(f"2. Verify alignment looks good")
         print(f"3. Update extraction script to use: {output_dir}/")
         print(f"4. Run extraction: python scripts/batch_smart_extraction.py")
         
-        print(f"\n🧪 Quick extraction test:")
+        print(f"\n Quick extraction test:")
         verify_extraction_on_aligned()
         
     else:

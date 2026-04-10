@@ -240,7 +240,7 @@ def extract_smart_from_image(image, image_index, image_name, output_suffix):
 def compare_extraction_modes():
     """Compare extraction results from different image sources"""
     print("="*60)
-    print("🔍 COMPARING EXTRACTION MODES")
+    print(" COMPARING EXTRACTION MODES")
     print("="*60)
     
     modes = [
@@ -251,7 +251,7 @@ def compare_extraction_modes():
     results = {}
     
     for mode_name, use_aligned, use_ready in modes:
-        print(f"\n▶ Processing {mode_name}...")
+        print(f"\n Processing {mode_name}...")
         head_rows, total_cells = batch_smart_extraction(
             use_aligned=use_aligned,
             use_ready=use_ready
@@ -263,7 +263,7 @@ def compare_extraction_modes():
     
     # Print comparison
     print(f"\n{'='*60}")
-    print("📊 COMPARISON RESULTS")
+    print(" COMPARISON RESULTS")
     print("="*60)
     
     print(f"\n{'Mode':<20} {'Head Rows':<12} {'Total Cells':<12}")
@@ -276,7 +276,7 @@ def compare_extraction_modes():
 
 if __name__ == "__main__":
     print("="*70)
-    print("📋 BATCH SMART EXTRACTION - MULTIPLE MODES")
+    print(" BATCH SMART EXTRACTION - MULTIPLE MODES")
     print("="*70)
     
     print("\nChoose extraction mode:")

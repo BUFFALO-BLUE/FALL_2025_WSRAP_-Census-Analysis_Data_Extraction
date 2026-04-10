@@ -23,12 +23,12 @@ class AdaptiveTableDetector:
         Detect table grid structure (rows and columns) in an image.
         Returns: dict with row_boundaries, column_boundaries, and success flag
         """
-        print(f"🔍 Detecting table grid in: {Path(image_path).name}")
+        print(f" Detecting table grid in: {Path(image_path).name}")
         
         # Load image
         img = cv2.imread(str(image_path))
         if img is None:
-            print(f"❌ Could not load image")
+            print(f" Could not load image")
             return None
         
         # Convert to grayscale and threshold
@@ -258,7 +258,7 @@ def batch_adaptive_extraction():
     """
     
     print("="*70)
-    print("🧠 ADAPTIVE TABLE EXTRACTION - SMART GRID DETECTION")
+    print("ADAPTIVE TABLE EXTRACTION - SMART GRID DETECTION")
     print("="*70)
     
     # Choose input folder
@@ -284,14 +284,14 @@ def batch_adaptive_extraction():
         output_suffix = "adaptive_aligned"
     
     if not input_dir.exists():
-        print(f"❌ Input directory not found: {input_dir}")
+        print(f" Input directory not found: {input_dir}")
         return
     
     # Get all images
     image_paths = sorted(list(input_dir.glob("*.jpg")))
     
     if not image_paths:
-        print(f"❌ No images found in {input_dir}")
+        print(f" No images found in {input_dir}")
         return
     
     print(f"\nFound {len(image_paths)} images")
@@ -316,7 +316,7 @@ def batch_adaptive_extraction():
             grid_result = detector.detect_table_grid(img_path)
             
             if not grid_result or not grid_result['success']:
-                print(f"  ❌ Table detection failed")
+                print(f"  Table detection failed")
                 all_results.append({
                     'image': img_path.name,
                     'success': False,
@@ -338,10 +338,10 @@ def batch_adaptive_extraction():
             
             extraction_stats.append(stats)
             
-            print(f"  ✅ Extracted: {stats['head_rows']} head rows, {stats['total_cells']} cells")
+            print(f" Extracted: {stats['head_rows']} head rows, {stats['total_cells']} cells")
             
         except Exception as e:
-            print(f"  ❌ Error: {e}")
+            print(f"  Error: {e}")
             all_results.append({
                 'image': img_path.name,
                 'success': False,
@@ -494,27 +494,27 @@ def save_extraction_results(all_results, extraction_stats, output_dir, suffix):
             ])
     
     print(f"\n{'='*70}")
-    print("🎉 ADAPTIVE EXTRACTION COMPLETE!")
+    print(" ADAPTIVE EXTRACTION COMPLETE!")
     print(f"{'='*70}")
-    print(f"\n📊 SUMMARY:")
+    print(f"\n SUMMARY:")
     print(f"  Images processed: {len(all_results)}")
     print(f"  Successful: {successful}")
     print(f"  Failed: {failed}")
     print(f"  Total head rows extracted: {total_head_rows}")
     print(f"  Total cells extracted: {total_cells}")
     
-    print(f"\n📁 Output saved to: {output_dir}")
-    print(f"📝 Results JSON: {results_file}")
-    print(f"📊 Summary CSV: {csv_file}")
+    print(f"\n Output saved to: {output_dir}")
+    print(f" Results JSON: {results_file}")
+    print(f" Summary CSV: {csv_file}")
     
     # Show successful detections
-    print(f"\n✅ Successful detections (first 5):")
+    print(f"\n Successful detections (first 5):")
     successful_results = [r for r in all_results if r['success']]
     for i, result in enumerate(successful_results[:5]):
         print(f"  {i+1}. {result['image']}: {result['num_rows']} rows, {result['num_columns']} columns")
     
     if failed > 0:
-        print(f"\n❌ Failed images:")
+        print(f"\n Failed images:")
         for result in all_results:
             if not result['success']:
                 print(f"  - {result['image']}: {result.get('error', 'Unknown error')}")
@@ -523,13 +523,13 @@ def test_single_image_detection(image_path):
     """
     Test table detection on a single image with visualization.
     """
-    print(f"🧪 Testing table detection on: {Path(image_path).name}")
+    print(f"Testing table detection on: {Path(image_path).name}")
     
     detector = AdaptiveTableDetector(debug=True)
     result = detector.detect_table_grid(image_path)
     
     if result and result['success']:
-        print(f"\n✅ Table detected successfully!")
+        print(f"\n Table detected successfully!")
         print(f"   Image shape: {result['image_shape']}")
         print(f"   Rows detected: {result['num_rows']}")
         print(f"   Columns detected: {result['num_columns']}")
@@ -555,16 +555,16 @@ def test_single_image_detection(image_path):
         viz_path = test_dir / f"{Path(image_path).stem}_grid.png"
         cv2.imwrite(str(viz_path), viz)
         
-        print(f"\n📊 Visualization saved to: {viz_path}")
+        print(f"\n Visualization saved to: {viz_path}")
         
         return result
     else:
-        print("❌ Table detection failed")
+        print(" Table detection failed")
         return None
 
 if __name__ == "__main__":
     print("="*70)
-    print("🧠 SMART ADAPTIVE TABLE DETECTION & EXTRACTION")
+    print(" SMART ADAPTIVE TABLE DETECTION & EXTRACTION")
     print("="*70)
     
     print("\nChoose mode:")
@@ -578,7 +578,7 @@ if __name__ == "__main__":
         # Test single image
         input_dir = Path("data/from_jeremy/images_aligned_to_first")
         if not input_dir.exists():
-            print(f"❌ Directory not found: {input_dir}")
+            print(f" Directory not found: {input_dir}")
             exit()
         
         # Get first few images
@@ -604,7 +604,7 @@ if __name__ == "__main__":
     
     elif choice == '3':
         # Compare extraction methods
-        print("\n🔍 Comparing extraction methods...")
+        print("\n Comparing extraction methods...")
         print("1. Adaptive detection (this script)")
         print("2. Fixed coordinates (previous method)")
         print("3. Both")

@@ -245,7 +245,7 @@ def load_processed_keys_from_many_excels(output_xlsx: Path) -> set:
         try:
             df = pd.read_excel(f, sheet_name="Raw_OCR_Debug", engine="openpyxl")
             if not {"Census_Image", "Row", "Field"}.issubset(df.columns):
-                print(f"⚠️ {Path(f).name}: missing required columns, skipping.")
+                print(f" {Path(f).name}: missing required columns, skipping.")
                 continue
 
             before = len(processed_keys)
@@ -255,14 +255,14 @@ def load_processed_keys_from_many_excels(output_xlsx: Path) -> set:
                 )
             added = len(processed_keys) - before
 
-            print(f"✅ Loaded {added:,} keys from {Path(f).name}")
+            print(f"Loaded {added:,} keys from {Path(f).name}")
 
         except ValueError as e:
-            print(f"⚠️ {Path(f).name}: {e} (skipping)")
+            print(f" {Path(f).name}: {e} (skipping)")
         except Exception as e:
-            print(f"⚠️ Could not read {Path(f).name}: {e} (skipping)")
+            print(f" Could not read {Path(f).name}: {e} (skipping)")
 
-    print(f"✅ Total unique processed keys found: {len(processed_keys):,}")
+    print(f" Total unique processed keys found: {len(processed_keys):,}")
     return processed_keys
 
 
@@ -358,7 +358,7 @@ def main():
     processed_keys |= load_processed_keys_from_many_excels(args.output_xlsx)
 
     if args.resume_from_xlsx and args.resume_from_xlsx.exists():
-        print(f"🔁 Also adding explicit resume file: {args.resume_from_xlsx}")
+        print(f" Also adding explicit resume file: {args.resume_from_xlsx}")
         try:
             prev_raw = pd.read_excel(
                 args.resume_from_xlsx, sheet_name="Raw_OCR_Debug", engine="openpyxl"
@@ -368,11 +368,11 @@ def main():
                     processed_keys.add(
                         (str(r["Census_Image"]), str(r["Row"]), str(r["Field"]))
                     )
-                print(f"✅ After explicit resume, total keys: {len(processed_keys):,}")
+                print(f" After explicit resume, total keys: {len(processed_keys):,}")
             else:
-                print("⚠️ Explicit resume file missing required columns; ignoring it.")
+                print(" Explicit resume file missing required columns; ignoring it.")
         except Exception as e:
-            print(f"⚠️ Could not load explicit resume file: {e}")
+            print(f" Could not load explicit resume file: {e}")
 
     processed = 0
 
@@ -400,10 +400,10 @@ def main():
     try:
         for i_scanned, img_path in enumerate(images, 1):
             if args.max_minutes and (time.time() - start_time) > args.max_minutes * 60:
-                print(f"⏹ Time limit reached ({args.max_minutes} min). Writing PARTIAL Excel...")
+                print(f" Time limit reached ({args.max_minutes} min). Writing PARTIAL Excel...")
                 partial = args.output_xlsx.with_name(args.output_xlsx.stem + "_PARTIAL.xlsx")
                 write_excel(partial, structured, raw_rows)
-                print(f"✅ Partial Excel written to: {partial}")
+                print(f" Partial Excel written to: {partial}")
                 return
 
             meta = parse_meta(root, img_path)
@@ -478,39 +478,39 @@ def main():
 
             if args.checkpoint_every and ckpt_path and (processed % args.checkpoint_every == 0):
                 print(
-                    f"💾 Writing checkpoint at processed={processed} "
+                    f" Writing checkpoint at processed={processed} "
                     f"(scan {i_scanned}/{len(images)}) → {ckpt_path}"
                 )
                 try:
                     write_excel(ckpt_path, structured, raw_rows)
-                    print("✅ Checkpoint written.")
+                    print(" Checkpoint written.")
                 except Exception as e:
-                    print(f"⚠️ Checkpoint write failed: {e}")
+                    print(f" Checkpoint write failed: {e}")
 
         progress_line(len(images), "(done)")
         write_excel(args.output_xlsx, structured, raw_rows)
 
         total_time = time.time() - start_time
-        print(f"✅ Excel written to: {args.output_xlsx}")
+        print(f"Excel written to: {args.output_xlsx}")
         if processed > 0:
             print(
-                f"🏁 Total runtime: {fmt_seconds(total_time)} for {processed} processed images "
+                f" Total runtime: {fmt_seconds(total_time)} for {processed} processed images "
                 f"(~{(total_time/processed):.3f}s/img)"
             )
         else:
             print(
-                f"🏁 Total runtime: {fmt_seconds(total_time)} "
+                f" Total runtime: {fmt_seconds(total_time)} "
                 f"(processed 0 images — check filters/resume keys)."
             )
 
     except KeyboardInterrupt:
-        print("🛑 Interrupted by user (Ctrl+C). Writing PARTIAL Excel now...")
+        print(" Interrupted by user (Ctrl+C). Writing PARTIAL Excel now...")
         partial = args.output_xlsx.with_name(args.output_xlsx.stem + "_PARTIAL.xlsx")
         try:
             write_excel(partial, structured, raw_rows)
-            print(f"✅ Partial Excel written to: {partial}")
+            print(f"Partial Excel written to: {partial}")
         except Exception as e:
-            print(f"⚠️ Could not write partial Excel: {e}")
+            print(f" Could not write partial Excel: {e}")
 
 
 if __name__ == "__main__":
